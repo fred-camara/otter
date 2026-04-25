@@ -2,9 +2,12 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,9 +47,11 @@ func NewOrchestrator(allowedDirs []string, planner Planner) (*Orchestrator, erro
 	}
 	readTool := tools.NewReadFileTool(normalizedDirs)
 	summarizeTool := tools.NewSummarizeFilesTool(normalizedDirs)
+	writeTool := tools.NewWriteFileTool(normalizedDirs)
+	moveTool := tools.NewMoveFileTool(normalizedDirs)
 
 	return &Orchestrator{
-		registry:    tools.NewRegistry(listTool, readTool, summarizeTool),
+		registry:    tools.NewRegistry(listTool, readTool, summarizeTool, writeTool, moveTool),
 		planner:     planner,
 		allowedDirs: normalizedDirs,
 	}, nil
@@ -87,6 +92,14 @@ func RunTask(task string) string {
 func (o *Orchestrator) Run(task string) string {
 	if o.planner == nil {
 		return fmt.Sprintf("🦦 Stub: I received your task: %q", task)
+	}
+
+	if response, handled := o.handleComposedTask(task); handled {
+		return response
+	}
+
+	if response, handled := o.handleUndoTask(task); handled {
+		return response
 	}
 
 	if directCall, ok := o.directToolCallForTask(task); ok {
@@ -225,7 +238,8 @@ Rules:
 - Use only these tools: %s
 - Never delete files
 - Never use shell commands
-- Prefer safe read/list/summarize
+- Never use network or external APIs
+- Prefer safe read/list/summarize/write/move
 - No markdown, no explanations
 - Do not include any text before or after the JSON object
 
@@ -248,6 +262,10 @@ func normalizeToolName(value string) string {
 		return "summarize_files"
 	case "summarize_notes":
 		return "summarize_files"
+	case "write", "writefile", "create_file":
+		return "write_file"
+	case "move", "mv", "movefile":
+		return "move_file"
 	}
 	return normalized
 }
@@ -328,6 +346,16 @@ func (o *Orchestrator) directToolCallForTask(task string) (ToolCall, bool) {
 			return ToolCall{Tool: "read_file", Input: input}, true
 		}
 	}
+	if isOrganizeDownloadsRequest(lowered) {
+		return o.planOrganizeDownloads(task)
+	}
+	if strings.Contains(lowered, "write a summary report to ") || strings.Contains(lowered, "write summary report to ") {
+		call, err := o.summaryReportToolCall(task)
+		if err != nil {
+			return ToolCall{Error: err.Error()}, true
+		}
+		return call, true
+	}
 
 	return ToolCall{}, false
 }
@@ -343,7 +371,7 @@ func (o *Orchestrator) executeToolCall(task string, parsed ToolCall) string {
 		}
 	}
 
-	if err := permissions.Validate(parsed.Tool); err != nil {
+	if err := permissions.ValidateToolCall(parsed.Tool, parsed.Input); err != nil {
 		return fmt.Sprintf("🦦 Permission denied: %v\n\n%s", err, o.accessGuidance())
 	}
 
@@ -354,18 +382,18 @@ func (o *Orchestrator) executeToolCall(task string, parsed ToolCall) string {
 		parsed.Input = coerceReadFileInput(parsed.Input, task)
 	}
 
-	result, err := o.registry.Execute(parsed.Tool, parsed.Input)
+	result, err := o.runTool(parsed.Tool, parsed.Input)
 	if err != nil {
 		if parsed.Tool == "list_files" {
 			fallbackInput := coerceListFilesInput(json.RawMessage("{}"), task)
-			fallbackResult, fallbackErr := o.registry.Execute(parsed.Tool, fallbackInput)
+			fallbackResult, fallbackErr := o.runTool(parsed.Tool, fallbackInput)
 			if fallbackErr == nil {
 				return "🦦 " + fallbackResult
 			}
 		}
 		if parsed.Tool == "read_file" && inferSafeToolFromTask(task) == "list_files" {
 			fallbackInput := coerceListFilesInput(json.RawMessage("{}"), task)
-			fallbackResult, fallbackErr := o.registry.Execute("list_files", fallbackInput)
+			fallbackResult, fallbackErr := o.runTool("list_files", fallbackInput)
 			if fallbackErr == nil {
 				return "🦦 " + fallbackResult
 			}
@@ -376,7 +404,106 @@ func (o *Orchestrator) executeToolCall(task string, parsed ToolCall) string {
 		return fmt.Sprintf("🦦 Tool error: %v", err)
 	}
 
+	if parsed.Tool == "move_file" && strings.HasPrefix(result, "Moved files:") {
+		if err := o.recordMoveHistory(task, parsed.Input); err != nil {
+			log.Printf("otter move history save failed: %v", err)
+		}
+	}
+
 	return "🦦 " + result
+}
+
+func (o *Orchestrator) runTool(toolName string, input json.RawMessage) (string, error) {
+	if err := permissions.ValidateToolCall(toolName, input); err != nil {
+		return "", err
+	}
+	log.Printf("otter tool start: %s", toolName)
+	result, err := o.registry.Execute(toolName, input)
+	if err != nil {
+		log.Printf("otter tool fail: %s err=%v", toolName, err)
+		return "", err
+	}
+	log.Printf("otter tool success: %s", toolName)
+	return result, nil
+}
+
+type moveHistoryInput struct {
+	Source  string              `json:"source"`
+	Target  string              `json:"target"`
+	Moves   []map[string]string `json:"moves"`
+	Confirm bool                `json:"confirm"`
+}
+
+func (o *Orchestrator) recordMoveHistory(task string, input json.RawMessage) error {
+	var req moveHistoryInput
+	if err := json.Unmarshal(input, &req); err != nil {
+		return err
+	}
+
+	records := make([]settings.MoveRecord, 0, len(req.Moves)+1)
+	if strings.TrimSpace(req.Source) != "" || strings.TrimSpace(req.Target) != "" {
+		records = append(records, settings.MoveRecord{
+			Source: strings.TrimSpace(req.Source),
+			Target: strings.TrimSpace(req.Target),
+		})
+	}
+	for _, move := range req.Moves {
+		source := strings.TrimSpace(move["source"])
+		target := strings.TrimSpace(move["target"])
+		if source == "" || target == "" {
+			continue
+		}
+		records = append(records, settings.MoveRecord{
+			Source: source,
+			Target: target,
+		})
+	}
+	if len(records) == 0 {
+		return nil
+	}
+
+	return settings.SaveMoveHistory(settings.MoveHistory{
+		Task:      task,
+		CreatedAt: time.Now(),
+		Moves:     records,
+	})
+}
+
+func (o *Orchestrator) handleUndoTask(task string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(task))
+	if !isUndoRequest(lower) {
+		return "", false
+	}
+
+	history, err := settings.LoadMoveHistory()
+	if err != nil {
+		return fmt.Sprintf("🦦 I couldn't load the last move history: %v", err), true
+	}
+	if len(history.Moves) == 0 {
+		return "🦦 I don't have a recent move to undo.", true
+	}
+
+	reversed := make([]map[string]string, 0, len(history.Moves))
+	for index := len(history.Moves) - 1; index >= 0; index-- {
+		move := history.Moves[index]
+		reversed = append(reversed, map[string]string{
+			"source": move.Target,
+			"target": move.Source,
+		})
+	}
+
+	input, _ := json.Marshal(map[string]any{
+		"moves":   reversed,
+		"confirm": true,
+	})
+	result, err := o.runTool("move_file", input)
+	if err != nil {
+		return fmt.Sprintf("🦦 I couldn't undo the last move: %v", err), true
+	}
+	if err := settings.ClearMoveHistory(); err != nil {
+		log.Printf("otter move history clear failed: %v", err)
+	}
+	return "🦦 Undid the last move.\n" + result, true
 }
 
 func inferSafeToolFromTask(task string) string {
@@ -388,9 +515,21 @@ func inferSafeToolFromTask(task string) string {
 		return "read_file"
 	case strings.Contains(lower, "summar"), strings.Contains(lower, "latest notes"):
 		return "summarize_files"
+	case strings.Contains(lower, "write"), strings.Contains(lower, "create"):
+		return "write_file"
+	case strings.Contains(lower, "move"), strings.Contains(lower, "organize"):
+		return "move_file"
 	default:
 		return ""
 	}
+}
+
+func isUndoRequest(taskLower string) bool {
+	return taskLower == "undo" ||
+		strings.Contains(taskLower, "undo last move") ||
+		strings.Contains(taskLower, "undo organize") ||
+		strings.Contains(taskLower, "undo that") ||
+		strings.Contains(taskLower, "revert last move")
 }
 
 func coerceReadFileInput(raw json.RawMessage, task string) json.RawMessage {
@@ -421,7 +560,32 @@ func sanitizeTaskPath(value string) string {
 	clean := strings.TrimSpace(value)
 	clean = strings.Trim(clean, "\"'`")
 	clean = strings.TrimRight(clean, "?.!,;:")
+	clean = stripTaskFlags(clean)
 	return clean
+}
+
+func stripTaskFlags(value string) string {
+	clean := strings.TrimSpace(value)
+	for {
+		lower := strings.ToLower(clean)
+		stripped := false
+		for _, token := range []string{"confirm=true", "confirm=false", "overwrite=true", "overwrite=false", "confirm", "overwrite"} {
+			index := strings.LastIndex(lower, token)
+			if index < 0 {
+				continue
+			}
+			if strings.TrimSpace(clean[index+len(token):]) != "" {
+				continue
+			}
+			clean = strings.TrimSpace(clean[:index])
+			clean = strings.TrimRight(clean, "?.!,;:")
+			stripped = true
+			break
+		}
+		if !stripped {
+			return clean
+		}
+	}
 }
 
 func extractDaysWindow(taskLower string, fallback int) int {
@@ -679,12 +843,509 @@ func (o *Orchestrator) helpMessage() string {
 	return "I can currently:\n" +
 		"- list files in a folder\n" +
 		"- read text files\n" +
-		"- summarize note files\n\n" +
+		"- summarize note files\n" +
+		"- write new files safely\n" +
+		"- move files safely (with dry-run for batches)\n" +
+		"- undo the last move\n\n" +
 		"Examples:\n" +
 		"- otter \"list files in ~/Downloads\"\n" +
 		"- otter \"read ~/notes/today.md\"\n" +
-		"- otter \"Read my latest notes over the last 10 days\"\n\n" +
+		"- otter \"Read my latest notes over the last 10 days\"\n" +
+		"- otter \"undo last move\"\n\n" +
 		o.accessGuidance()
+}
+
+func (o *Orchestrator) handleComposedTask(task string) (string, bool) {
+	trimmed := strings.TrimSpace(task)
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "read ") && strings.Contains(lower, " then write ") {
+		response := o.runReadAndWriteTask(trimmed)
+		return response, true
+	}
+	return "", false
+}
+
+func (o *Orchestrator) runReadAndWriteTask(task string) string {
+	sources, outputPath, err := parseReadThenWriteTask(task)
+	if err != nil {
+		return "🦦 " + err.Error()
+	}
+
+	contents := make(map[string]string, len(sources))
+	for _, source := range sources {
+		input, _ := json.Marshal(map[string]string{"path": source})
+		readResult, runErr := o.runTool("read_file", input)
+		if runErr != nil {
+			if strings.Contains(strings.ToLower(runErr.Error()), "outside allowed directories") {
+				return fmt.Sprintf("🦦 %v\n\n%s", runErr, o.accessGuidance())
+			}
+			return fmt.Sprintf("🦦 Couldn't read %s: %v", source, runErr)
+		}
+		contents[source] = stripReadPrefix(readResult)
+	}
+
+	report := synthesizeFromSources(contents)
+	writeInput, _ := json.Marshal(map[string]any{
+		"path":      outputPath,
+		"content":   report,
+		"overwrite": false,
+	})
+	writeResult, runErr := o.runTool("write_file", writeInput)
+	if runErr != nil {
+		if strings.Contains(strings.ToLower(runErr.Error()), "outside allowed directories") {
+			return fmt.Sprintf("🦦 %v\n\n%s", runErr, o.accessGuidance())
+		}
+		return fmt.Sprintf("🦦 Couldn't write output file: %v", runErr)
+	}
+
+	writtenPath := extractWrittenPath(writeResult)
+	return fmt.Sprintf("🦦 Wrote synthesized plan to %s\nSummary: used %d source files and created a new file without overwrite.", writtenPath, len(sources))
+}
+
+func parseReadThenWriteTask(task string) ([]string, string, error) {
+	re := regexp.MustCompile(`(?i)^read\s+(.+?)\s+then write\s+.+?\s+to\s+(.+)$`)
+	matches := re.FindStringSubmatch(strings.TrimSpace(task))
+	if len(matches) != 3 {
+		return nil, "", errors.New("I couldn't parse that request. Try: otter \"read <file1> and <file2>, then write a new report to <output-file>\"")
+	}
+
+	sourceChunk := strings.Trim(matches[1], " ,")
+	output := sanitizeTaskPath(matches[2])
+	output = strings.Trim(output, ",")
+	if output == "" {
+		return nil, "", errors.New("output path is required")
+	}
+
+	parts := strings.Split(sourceChunk, " and ")
+	if len(parts) < 2 {
+		return nil, "", errors.New("please provide at least two source files with 'and'")
+	}
+	sources := make([]string, 0, len(parts))
+	for _, part := range parts {
+		candidate := sanitizeTaskPath(part)
+		candidate = strings.Trim(candidate, ",")
+		if candidate == "" {
+			continue
+		}
+		sources = append(sources, candidate)
+	}
+	if len(sources) < 2 {
+		return nil, "", errors.New("please provide at least two valid source files")
+	}
+	return uniqueStrings(sources), output, nil
+}
+
+func synthesizeFromSources(contents map[string]string) string {
+	paths := make([]string, 0, len(contents))
+	for path := range contents {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	builder := strings.Builder{}
+	builder.WriteString("# Otter Synthesized Plan\n\n")
+	builder.WriteString(fmt.Sprintf("Generated: %s\n\n", time.Now().Format(time.RFC3339)))
+	builder.WriteString("## Source files\n")
+	for _, path := range paths {
+		builder.WriteString("- " + path + "\n")
+	}
+	builder.WriteString("\n## Key points\n")
+	for _, path := range paths {
+		excerpt := firstNonEmptyLine(contents[path])
+		if len(excerpt) > 140 {
+			excerpt = excerpt[:140] + "..."
+		}
+		builder.WriteString(fmt.Sprintf("- %s: %s\n", filepath.Base(path), excerpt))
+	}
+	builder.WriteString("\n## Draft actions\n")
+	builder.WriteString("- Align outreach priorities with the notes above.\n")
+	builder.WriteString("- Prepare a concise message draft per contact.\n")
+	builder.WriteString("- Track follow-ups and next decision date.\n")
+	return builder.String()
+}
+
+func firstNonEmptyLine(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return "(no content)"
+}
+
+func stripReadPrefix(result string) string {
+	if index := strings.Index(result, ":\n"); index >= 0 && index+2 < len(result) {
+		return result[index+2:]
+	}
+	return result
+}
+
+func isOrganizeDownloadsRequest(taskLower string) bool {
+	return strings.Contains(taskLower, "organize") && (strings.Contains(taskLower, "downloads") ||
+		strings.Contains(taskLower, "subfolder") ||
+		strings.Contains(taskLower, "folder") ||
+		strings.Contains(taskLower, "music"))
+}
+
+func (o *Orchestrator) planOrganizeDownloads(task string) (ToolCall, bool) {
+	previewOnly := strings.Contains(strings.ToLower(task), "preview") ||
+		strings.Contains(strings.ToLower(task), "dry run") ||
+		strings.Contains(strings.ToLower(task), "dry-run")
+
+	sourceRoot, err := resolveOrganizeSourceRoot(task, o.allowedDirs)
+	if err != nil {
+		return ToolCall{Error: fmt.Sprintf("I couldn't resolve a source folder for that request: %v", err)}, true
+	}
+
+	targetFolder := extractOrganizeTargetFolder(task)
+	musicOnly := strings.Contains(strings.ToLower(task), "music")
+
+	moves, err := buildDownloadMoves(sourceRoot, targetFolder, musicOnly)
+	if err != nil {
+		return ToolCall{Error: fmt.Sprintf("I couldn't plan Download organization: %v", err)}, true
+	}
+	if len(moves) == 0 {
+		return ToolCall{Error: "Downloads already looks organized. I found no files to move."}, true
+	}
+
+	input, _ := json.Marshal(map[string]any{
+		"moves":   moves,
+		"confirm": !previewOnly,
+	})
+	return ToolCall{Tool: "move_file", Input: input}, true
+}
+
+func resolveOrganizeSourceRoot(task string, allowedDirs []string) (string, error) {
+	if pathValue := extractOrganizeSourcePath(task); pathValue != "" {
+		resolved, err := tools.ResolvePath(pathValue)
+		if err != nil {
+			return "", err
+		}
+		return resolved, nil
+	}
+
+	for _, candidate := range allowedDirs {
+		if strings.EqualFold(filepath.Base(candidate), "Downloads") {
+			return candidate, nil
+		}
+	}
+	if len(allowedDirs) > 0 {
+		return allowedDirs[0], nil
+	}
+	return "", fmt.Errorf("no allowed directories are configured")
+}
+
+func extractOrganizeSourcePath(task string) string {
+	lower := strings.ToLower(task)
+	for _, marker := range []string{" from ", " in ", " out of ", " under "} {
+		index := strings.Index(lower, marker)
+		if index < 0 {
+			continue
+		}
+		remainder := strings.TrimSpace(task[index+len(marker):])
+		remainder = strings.TrimSpace(strings.TrimSuffix(remainder, "."))
+		remainder = strings.TrimSpace(strings.TrimSuffix(remainder, ","))
+		if remainder == "" {
+			continue
+		}
+		lowerRemainder := strings.ToLower(remainder)
+		for _, stop := range []string{" into ", " to ", " called ", " named ", " subfolder ", " folder "} {
+			if stopIndex := strings.Index(lowerRemainder, stop); stopIndex >= 0 {
+				remainder = strings.TrimSpace(remainder[:stopIndex])
+				lowerRemainder = strings.ToLower(remainder)
+			}
+		}
+		clean := sanitizeTaskPath(remainder)
+		if looksLikeOrganizeSource(clean) {
+			return clean
+		}
+	}
+	return ""
+}
+
+func looksLikeOrganizeSource(value string) bool {
+	clean := strings.ToLower(strings.TrimSpace(value))
+	if clean == "" {
+		return false
+	}
+	if strings.HasPrefix(clean, "~/") || strings.HasPrefix(clean, "$home/") || strings.HasPrefix(clean, "/") {
+		return true
+	}
+	if strings.Contains(clean, string(os.PathSeparator)) {
+		return true
+	}
+	for _, token := range []string{"downloads", "desktop", "documents", "music", "pictures", "movies", "videos", "notes", "work", "projects"} {
+		if clean == token || strings.HasPrefix(clean, token+" ") || strings.HasPrefix(clean, "my "+token) || strings.Contains(clean, "/"+token) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractOrganizeTargetFolder(task string) string {
+	lower := strings.ToLower(task)
+	for _, marker := range []string{"subfolder called", "folder called", "subfolder named", "folder named"} {
+		index := strings.Index(lower, marker)
+		if index < 0 {
+			continue
+		}
+		candidate := strings.TrimSpace(task[index+len(marker):])
+		candidate = sanitizeTaskPath(candidate)
+		candidate = strings.Trim(candidate, "\"'`")
+		candidate = strings.Trim(candidate, ",.")
+		if candidate != "" {
+			return canonicalOrganizerFolderName(candidate)
+		}
+	}
+
+	if strings.Contains(lower, "audio") {
+		return "Audio"
+	}
+	return ""
+}
+
+func canonicalOrganizerFolderName(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "audio":
+		return "Audio"
+	case "documents":
+		return "Documents"
+	case "images":
+		return "Images"
+	case "archives":
+		return "Archives"
+	case "code":
+		return "Code"
+	case "video", "videos":
+		return "Video"
+	case "other":
+		return "Other"
+	default:
+		return strings.TrimSpace(name)
+	}
+}
+
+func buildDownloadMoves(rootPath, targetFolder string, musicOnly bool) ([]map[string]string, error) {
+	moves := make([]map[string]string, 0, 32)
+	categoryCache := make(map[string]string)
+	err := filepath.WalkDir(rootPath, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			if targetFolder != "" && strings.EqualFold(name, targetFolder) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if musicOnly && !isMusicFile(name) {
+			return nil
+		}
+		source := filepath.Clean(path)
+		category := targetFolder
+		if category == "" {
+			category = categorizeDownloadFile(name)
+		}
+		if parentCategory, ok := uniformDirectoryCategory(filepath.Dir(source), rootPath, categoryCache); ok && parentCategory == category {
+			relativePath, relErr := filepath.Rel(rootPath, source)
+			if relErr == nil {
+				moves = append(moves, map[string]string{
+					"source": source,
+					"target": filepath.Join(rootPath, category, relativePath),
+				})
+				return nil
+			}
+		}
+		target := filepath.Join(rootPath, category, name)
+		if source == target {
+			return nil
+		}
+		moves = append(moves, map[string]string{
+			"source": source,
+			"target": target,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return moves, nil
+}
+
+func uniformDirectoryCategory(dirPath, rootPath string, cache map[string]string) (string, bool) {
+	cleanDir := filepath.Clean(dirPath)
+	cleanRoot := filepath.Clean(rootPath)
+	if !strings.HasPrefix(cleanDir, cleanRoot) {
+		return "", false
+	}
+	if category, ok := cache[cleanDir]; ok {
+		return category, category != ""
+	}
+
+	entries, err := os.ReadDir(cleanDir)
+	if err != nil {
+		cache[cleanDir] = ""
+		return "", false
+	}
+
+	category := ""
+	hasVisibleFile := false
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		if entry.IsDir() {
+			if strings.EqualFold(name, "Audio") {
+				continue
+			}
+			childCategory, childOK := uniformDirectoryCategory(filepath.Join(cleanDir, name), cleanRoot, cache)
+			if !childOK {
+				cache[cleanDir] = ""
+				return "", false
+			}
+			if category == "" {
+				category = childCategory
+			} else if category != childCategory {
+				cache[cleanDir] = ""
+				return "", false
+			}
+			continue
+		}
+
+		hasVisibleFile = true
+		fileCategory := categorizeDownloadFile(name)
+		if fileCategory == "" {
+			cache[cleanDir] = ""
+			return "", false
+		}
+		if category == "" {
+			category = fileCategory
+		} else if category != fileCategory {
+			cache[cleanDir] = ""
+			return "", false
+		}
+	}
+
+	if !hasVisibleFile || category == "" {
+		cache[cleanDir] = ""
+		return "", false
+	}
+
+	cache[cleanDir] = category
+	return category, true
+}
+
+func isMusicFile(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".aiff":
+		return true
+	default:
+		return false
+	}
+}
+
+func categorizeDownloadFile(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic":
+		return "Images"
+	case ".pdf", ".doc", ".docx", ".txt", ".md", ".rtf", ".pages":
+		return "Documents"
+	case ".zip", ".rar", ".7z", ".tar", ".gz":
+		return "Archives"
+	case ".mp3", ".wav", ".m4a":
+		return "Audio"
+	case ".mp4", ".mov", ".mkv":
+		return "Video"
+	case ".go", ".js", ".ts", ".py", ".java", ".rb", ".sh":
+		return "Code"
+	default:
+		return "Other"
+	}
+}
+
+func (o *Orchestrator) summaryReportToolCall(task string) (ToolCall, error) {
+	path, err := extractTargetPath(task, "to")
+	if err != nil {
+		return ToolCall{}, err
+	}
+	if strings.TrimSpace(path) == "" {
+		return ToolCall{}, fmt.Errorf("please include a destination path")
+	}
+	paths, collectErr := collectRecentNotePaths(o.allowedDirs, 10, 8)
+	if collectErr != nil {
+		return ToolCall{}, fmt.Errorf("I couldn't scan notes: %w", collectErr)
+	}
+	if len(paths) == 0 {
+		return ToolCall{}, fmt.Errorf("I couldn't find note files in allowed directories.\n\n%s", notesAccessGuidance())
+	}
+	content := o.buildSummaryReportContent(paths)
+	target := buildReportTarget(path)
+	input, _ := json.Marshal(map[string]any{
+		"path":      target,
+		"content":   content,
+		"overwrite": false,
+	})
+	return ToolCall{Tool: "write_file", Input: input}, nil
+}
+
+func (o *Orchestrator) buildSummaryReportContent(paths []string) string {
+	input, _ := json.Marshal(map[string]any{"paths": paths})
+	result, err := o.runTool("summarize_files", input)
+	if err != nil {
+		return "Summary:\n- I couldn't summarize files automatically."
+	}
+	builder := strings.Builder{}
+	builder.WriteString("# Otter Summary Report\n\n")
+	builder.WriteString(fmt.Sprintf("Generated: %s\n\n", time.Now().Format(time.RFC3339)))
+	builder.WriteString("## Source files\n")
+	for _, path := range paths {
+		builder.WriteString("- " + path + "\n")
+	}
+	builder.WriteString("\n## Summary\n")
+	builder.WriteString(strings.TrimSpace(result))
+	builder.WriteString("\n")
+	return builder.String()
+}
+
+func extractTargetPath(task, marker string) (string, error) {
+	lower := strings.ToLower(task)
+	find := " " + strings.ToLower(marker) + " "
+	index := strings.LastIndex(lower, find)
+	if index < 0 {
+		return "", fmt.Errorf("destination path is required")
+	}
+	path := strings.TrimSpace(task[index+len(find):])
+	path = sanitizeTaskPath(path)
+	if path == "" {
+		return "", fmt.Errorf("destination path is required")
+	}
+	return path, nil
+}
+
+func buildReportTarget(path string) string {
+	if strings.HasSuffix(strings.ToLower(path), ".md") || strings.HasSuffix(strings.ToLower(path), ".txt") {
+		return path
+	}
+	filename := fmt.Sprintf("otter-summary-%s.md", time.Now().Format("20060102-150405"))
+	return filepath.Join(path, filename)
+}
+
+func extractWrittenPath(result string) string {
+	const prefix = "Wrote file: "
+	if strings.HasPrefix(result, prefix) {
+		return strings.TrimSpace(strings.TrimPrefix(result, prefix))
+	}
+	return strings.TrimSpace(result)
 }
 
 func extractAccessTargets(task string) ([]string, error) {

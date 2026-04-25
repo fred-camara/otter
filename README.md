@@ -8,8 +8,9 @@ This milestone includes:
 - local HTTP endpoint: `POST /run`
 - bearer token authentication
 - local Ollama planner (`qwen2.5-coder:14b` by default)
-- safe tool loop (`list_files`, `read_file`, `summarize_files`)
-- permission gate (safe tools only in this milestone)
+- safe tool loop (`list_files`, `read_file`, `summarize_files`, `write_file`, `move_file`)
+- permission gate for write/move confirmations
+- move history undo for the last file move
 
 ## Quick start
 
@@ -63,6 +64,9 @@ curl -sS -X POST http://127.0.0.1:8080/run \
 ```bash
 otter "list files in $HOME/Downloads"
 otter "summarize files $HOME/notes/today.md and $HOME/notes/todo.md"
+otter "write a summary report to ~/Documents/Otter/reports"
+otter "organize my downloads"
+otter "undo last move"
 otter "give otter access to Desktop and Documents"
 otter "what directories can otter access?"
 ```
@@ -91,8 +95,10 @@ Note: Otter currently reads note files from folders (`.md`/`.txt`). Direct Apple
 
 ## Current safety scope
 
-- Allowed tools: `list_files`, `read_file`, `summarize_files`
-- Blocked in this milestone: `write_file`, `move_file`
+- Allowed tools: `list_files`, `read_file`, `summarize_files`, `write_file`, `move_file`
+- `write_file`: create-only by default, overwrite requires `overwrite=true` and `confirm=true`
+- `move_file`: no overwrite; multi-move returns dry-run first unless `confirm=true`
+- `undo last move`: reverses the most recent successful move batch
 - Forbidden: delete, arbitrary shell, external API calls
 
 ## Tests

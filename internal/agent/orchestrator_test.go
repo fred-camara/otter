@@ -214,3 +214,225 @@ func TestExecuteToolCallShowsAccessGuidance(t *testing.T) {
 		t.Fatalf("expected access guidance, got: %s", result)
 	}
 }
+
+func TestRunReadThenWriteCreatesNewFile(t *testing.T) {
+	root := t.TempDir()
+	first := filepath.Join(root, "jamma-yoon.md")
+	second := filepath.Join(root, "prospects.md")
+	output := filepath.Join(root, "outreach-plan.md")
+
+	if err := os.WriteFile(first, []byte("Jamma: founder of Example"), 0o644); err != nil {
+		t.Fatalf("write first source: %v", err)
+	}
+	if err := os.WriteFile(second, []byte("Prospects: focus on design agencies"), 0o644); err != nil {
+		t.Fatalf("write second source: %v", err)
+	}
+
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	task := fmt.Sprintf("read %s and %s, then write a new outreach plan to %s", first, second, output)
+	result := orch.Run(task)
+	if !strings.Contains(result, output) {
+		t.Fatalf("expected output path in response, got: %s", result)
+	}
+
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("read output file: %v", err)
+	}
+	if !strings.Contains(string(data), "Otter Synthesized Plan") {
+		t.Fatalf("expected synthesized report content, got: %s", string(data))
+	}
+}
+
+func TestRunOrganizeDownloadsMovesFiles(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "otter", "config.json")
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		t.Fatalf("mkdir downloads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "a.pdf"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed download file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "b.png"), []byte("y"), 0o644); err != nil {
+		t.Fatalf("seed second download file: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	orch, err := NewOrchestrator([]string{downloads}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.Run("organize my downloads")
+	if !strings.Contains(result, "Moved files") {
+		t.Fatalf("expected moved files result, got: %s", result)
+	}
+	if !strings.Contains(result, "Documents") || !strings.Contains(result, "Images") {
+		t.Fatalf("expected categorized folders in result, got: %s", result)
+	}
+}
+
+func TestRunOrganizeMusicIntoAudioSubfolder(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "otter", "config.json")
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		t.Fatalf("mkdir downloads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "song-one.mp3"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed mp3: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "song-two.wav"), []byte("y"), 0o644); err != nil {
+		t.Fatalf("seed wav: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "paper.pdf"), []byte("z"), 0o644); err != nil {
+		t.Fatalf("seed pdf: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	orch, err := NewOrchestrator([]string{downloads}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.Run("organize my music files and place them into a subfolder called audio")
+	if !strings.Contains(result, "Moved files") {
+		t.Fatalf("expected moved files result, got: %s", result)
+	}
+	if !strings.Contains(strings.ToLower(result), "audio") {
+		t.Fatalf("expected audio target folder in result, got: %s", result)
+	}
+	if strings.Contains(result, "paper.pdf") {
+		t.Fatalf("non-music files should not be moved, got: %s", result)
+	}
+}
+
+func TestRunOrganizeMusicConfirmFlagDoesNotBecomeFolder(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "otter", "config.json")
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		t.Fatalf("mkdir downloads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "song.mp3"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed mp3: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	orch, err := NewOrchestrator([]string{downloads}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.Run("organize my music files and place them into a subfolder called audio confirm=true")
+	if strings.Contains(result, "confirm=true") {
+		t.Fatalf("confirm flag should not be treated as a folder name: %s", result)
+	}
+	if !strings.Contains(strings.ToLower(result), "audio") {
+		t.Fatalf("expected audio folder in output, got: %s", result)
+	}
+	if _, err := os.Stat(filepath.Join(downloads, "Audio", "song.mp3")); err != nil {
+		t.Fatalf("expected moved file in Audio folder: %v", err)
+	}
+}
+
+func TestRunOrganizeMusicFindsNestedFiles(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "otter", "config.json")
+	downloads := filepath.Join(home, "Downloads")
+	nested := filepath.Join(downloads, "Later")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "song.mp3"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed mp3: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	orch, err := NewOrchestrator([]string{downloads}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.Run("organize my music files and place them into a subfolder called audio")
+	if !strings.Contains(result, "Moved files") {
+		t.Fatalf("expected moved files result, got: %s", result)
+	}
+	if _, err := os.Stat(filepath.Join(downloads, "Audio", "Later", "song.mp3")); err != nil {
+		t.Fatalf("expected moved file in Audio folder: %v", err)
+	}
+}
+
+func TestRunOrganizeWeirdMusicPromptDefaultsToDownloads(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "otter", "config.json")
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		t.Fatalf("mkdir downloads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "song.mp3"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed mp3: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	orch, err := NewOrchestrator([]string{downloads}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.Run("organize my music files in audio confirm=true by taking them out and then placing them into a subfolder called audio")
+	if strings.Contains(strings.ToLower(result), "no such file") {
+		t.Fatalf("source parsing should not create invalid paths: %s", result)
+	}
+	if !strings.Contains(result, "Moved files") {
+		t.Fatalf("expected a move result, got: %s", result)
+	}
+	if _, err := os.Stat(filepath.Join(downloads, "Audio", "song.mp3")); err != nil {
+		t.Fatalf("expected moved file in Audio folder: %v", err)
+	}
+}
+
+func TestUndoLastMoveRestoresFiles(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "otter", "config.json")
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		t.Fatalf("mkdir downloads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "song.mp3"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed mp3: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	orch, err := NewOrchestrator([]string{downloads}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	moveResult := orch.Run("organize my music files and place them into a subfolder called audio")
+	if !strings.Contains(moveResult, "Moved files") {
+		t.Fatalf("expected move result, got: %s", moveResult)
+	}
+	if _, err := os.Stat(filepath.Join(downloads, "Audio", "song.mp3")); err != nil {
+		t.Fatalf("expected moved file in Audio folder: %v", err)
+	}
+
+	undoResult := orch.Run("undo last move")
+	if !strings.Contains(undoResult, "Undid the last move") {
+		t.Fatalf("expected undo result, got: %s", undoResult)
+	}
+	if _, err := os.Stat(filepath.Join(downloads, "song.mp3")); err != nil {
+		t.Fatalf("expected file restored to original location: %v", err)
+	}
+}
