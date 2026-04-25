@@ -44,7 +44,11 @@ func (t *ListFilesTool) Description() string {
 func (t *ListFilesTool) Execute(input json.RawMessage) (string, error) {
 	var req listFilesInput
 	if err := json.Unmarshal(input, &req); err != nil {
-		return "", errors.New("invalid list_files input")
+		var pathString string
+		if stringErr := json.Unmarshal(input, &pathString); stringErr != nil {
+			return "", errors.New("invalid list_files input")
+		}
+		req.Path = pathString
 	}
 	if strings.TrimSpace(req.Path) == "" {
 		pathValue, err := extractPathAlias(input, "path", "dir", "directory")

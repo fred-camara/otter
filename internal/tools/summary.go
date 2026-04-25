@@ -32,7 +32,11 @@ func (t *SummarizeFilesTool) Description() string {
 func (t *SummarizeFilesTool) Execute(input json.RawMessage) (string, error) {
 	var req summarizeFilesInput
 	if err := json.Unmarshal(input, &req); err != nil {
-		return "", errors.New("invalid summarize_files input")
+		var singlePath string
+		if stringErr := json.Unmarshal(input, &singlePath); stringErr != nil {
+			return "", errors.New("invalid summarize_files input")
+		}
+		req.Paths = []string{singlePath}
 	}
 	if len(req.Paths) == 0 {
 		paths, err := extractPathsAlias(input, "paths", "files")

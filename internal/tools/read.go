@@ -31,7 +31,11 @@ func (t *ReadFileTool) Description() string {
 func (t *ReadFileTool) Execute(input json.RawMessage) (string, error) {
 	var req readFileInput
 	if err := json.Unmarshal(input, &req); err != nil {
-		return "", errors.New("invalid read_file input")
+		var pathString string
+		if stringErr := json.Unmarshal(input, &pathString); stringErr != nil {
+			return "", errors.New("invalid read_file input")
+		}
+		req.Path = pathString
 	}
 	if strings.TrimSpace(req.Path) == "" {
 		pathValue, err := extractPathAlias(input, "path", "file", "filepath")

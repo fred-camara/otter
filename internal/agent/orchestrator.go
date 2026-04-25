@@ -5,10 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"otter/internal/model"
 	"otter/internal/permissions"
+	"otter/internal/settings"
 	"otter/internal/tools"
 )
 
@@ -19,8 +23,9 @@ const (
 )
 
 type Orchestrator struct {
-	registry *tools.Registry
-	planner  Planner
+	registry    *tools.Registry
+	planner     Planner
+	allowedDirs []string
 }
 
 type llmPlanner struct {
@@ -41,19 +46,27 @@ func NewOrchestrator(allowedDirs []string, planner Planner) (*Orchestrator, erro
 	summarizeTool := tools.NewSummarizeFilesTool(normalizedDirs)
 
 	return &Orchestrator{
-		registry: tools.NewRegistry(listTool, readTool, summarizeTool),
-		planner:  planner,
+		registry:    tools.NewRegistry(listTool, readTool, summarizeTool),
+		planner:     planner,
+		allowedDirs: normalizedDirs,
 	}, nil
 }
 
 func NewOrchestratorFromEnv() (*Orchestrator, error) {
-	dirs := parseAllowedDirs(os.Getenv("OTTER_ALLOWED_DIRS"))
+	var err error
+	envDirs := parseAllowedDirs(os.Getenv("OTTER_ALLOWED_DIRS"))
+	cfg, cfgErr := settings.Load()
+	savedDirs := []string{}
+	if cfgErr == nil {
+		savedDirs = cfg.AllowedDirs
+	}
+
+	dirs := mergeDirs(envDirs, savedDirs)
 	if len(dirs) == 0 {
-		fallbackDirs, err := defaultAllowedDirs()
+		dirs, err = defaultAllowedDirs()
 		if err != nil {
 			return nil, err
 		}
-		dirs = fallbackDirs
 	}
 
 	modelName := firstNonEmpty(strings.TrimSpace(os.Getenv("OTTER_MODEL")), defaultModelName)
@@ -76,7 +89,7 @@ func (o *Orchestrator) Run(task string) string {
 		return fmt.Sprintf("🦦 Stub: I received your task: %q", task)
 	}
 
-	if directCall, ok := directToolCallForTask(task); ok {
+	if directCall, ok := o.directToolCallForTask(task); ok {
 		return o.executeToolCall(task, directCall)
 	}
 
@@ -225,9 +238,15 @@ func normalizeToolName(value string) string {
 	switch strings.ToLower(normalized) {
 	case "ls", "list", "listfiles", "list_files_tool":
 		return "list_files"
+	case "file_explorer", "directory_listing", "scan_files":
+		return "list_files"
 	case "cat", "read", "readfile", "read_file_tool":
 		return "read_file"
+	case "read_notes", "open_file":
+		return "read_file"
 	case "summary", "summarize", "summarise", "summarizefiles", "summarize_file":
+		return "summarize_files"
+	case "summarize_notes":
 		return "summarize_files"
 	}
 	return normalized
@@ -235,7 +254,7 @@ func normalizeToolName(value string) string {
 
 func coerceListFilesInput(raw json.RawMessage, task string) json.RawMessage {
 	trimmed := strings.TrimSpace(string(raw))
-	if trimmed != "" && trimmed != "null" && trimmed != "{}" {
+	if trimmed != "" && trimmed != "null" && trimmed != "{}" && trimmed != "\"{}\"" && trimmed != "\"null\"" {
 		return raw
 	}
 
@@ -244,7 +263,7 @@ func coerceListFilesInput(raw json.RawMessage, task string) json.RawMessage {
 	if index := strings.LastIndex(lowered, " in "); index >= 0 {
 		candidate := strings.TrimSpace(task[index+4:])
 		if candidate != "" {
-			pathValue = candidate
+			pathValue = sanitizeTaskPath(candidate)
 		}
 	}
 
@@ -255,9 +274,36 @@ func coerceListFilesInput(raw json.RawMessage, task string) json.RawMessage {
 	return payload
 }
 
-func directToolCallForTask(task string) (ToolCall, bool) {
+func (o *Orchestrator) directToolCallForTask(task string) (ToolCall, bool) {
 	trimmed := strings.TrimSpace(task)
 	lowered := strings.ToLower(trimmed)
+
+	if isHelpRequest(lowered) {
+		return ToolCall{Error: o.helpMessage()}, true
+	}
+	if isAccessListRequest(lowered) {
+		return ToolCall{Error: o.listAccessMessage()}, true
+	}
+	if isAccessAddRequest(lowered) {
+		message, err := o.addAccessFromTask(trimmed)
+		if err != nil {
+			return ToolCall{Error: err.Error()}, true
+		}
+		return ToolCall{Error: message}, true
+	}
+
+	if strings.Contains(lowered, "latest notes") || (strings.Contains(lowered, "notes") && strings.Contains(lowered, "last") && strings.Contains(lowered, "day")) {
+		days := extractDaysWindow(lowered, 10)
+		paths, err := collectRecentNotePaths(o.allowedDirs, days, 20)
+		if err != nil {
+			return ToolCall{Error: fmt.Sprintf("I couldn't scan your notes safely: %v", err)}, true
+		}
+		if len(paths) == 0 {
+			return ToolCall{Error: fmt.Sprintf("I couldn't find note files from the last %d days in allowed directories.", days)}, true
+		}
+		input, _ := json.Marshal(map[string][]string{"paths": paths})
+		return ToolCall{Tool: "summarize_files", Input: input}, true
+	}
 
 	if strings.HasPrefix(lowered, "list files") {
 		pathValue := "."
@@ -284,12 +330,25 @@ func directToolCallForTask(task string) (ToolCall, bool) {
 }
 
 func (o *Orchestrator) executeToolCall(task string, parsed ToolCall) string {
+	if strings.TrimSpace(parsed.Error) != "" {
+		return "🦦 " + parsed.Error
+	}
+
+	if permissions.LevelForTool(parsed.Tool) == permissions.LevelForbidden {
+		if inferred := inferSafeToolFromTask(task); inferred != "" {
+			parsed.Tool = inferred
+		}
+	}
+
 	if err := permissions.Validate(parsed.Tool); err != nil {
-		return fmt.Sprintf("🦦 Permission denied: %v", err)
+		return fmt.Sprintf("🦦 Permission denied: %v\n\n%s", err, o.accessGuidance())
 	}
 
 	if parsed.Tool == "list_files" {
 		parsed.Input = coerceListFilesInput(parsed.Input, task)
+	}
+	if parsed.Tool == "read_file" {
+		parsed.Input = coerceReadFileInput(parsed.Input, task)
 	}
 
 	result, err := o.registry.Execute(parsed.Tool, parsed.Input)
@@ -301,8 +360,350 @@ func (o *Orchestrator) executeToolCall(task string, parsed ToolCall) string {
 				return "🦦 " + fallbackResult
 			}
 		}
+		if parsed.Tool == "read_file" && inferSafeToolFromTask(task) == "list_files" {
+			fallbackInput := coerceListFilesInput(json.RawMessage("{}"), task)
+			fallbackResult, fallbackErr := o.registry.Execute("list_files", fallbackInput)
+			if fallbackErr == nil {
+				return "🦦 " + fallbackResult
+			}
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "outside allowed directories") {
+			return fmt.Sprintf("🦦 %v\n\n%s", err, o.accessGuidance())
+		}
 		return fmt.Sprintf("🦦 Tool error: %v", err)
 	}
 
 	return "🦦 " + result
+}
+
+func inferSafeToolFromTask(task string) string {
+	lower := strings.ToLower(task)
+	switch {
+	case strings.Contains(lower, "list"), strings.Contains(lower, "files in"), strings.Contains(lower, "show files"), strings.Contains(lower, "folder"):
+		return "list_files"
+	case strings.Contains(lower, "read"), strings.Contains(lower, "open"):
+		return "read_file"
+	case strings.Contains(lower, "summar"), strings.Contains(lower, "latest notes"):
+		return "summarize_files"
+	default:
+		return ""
+	}
+}
+
+func coerceReadFileInput(raw json.RawMessage, task string) json.RawMessage {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed != "" && trimmed != "null" && trimmed != "{}" && trimmed != "\"{}\"" && trimmed != "\"null\"" {
+		return raw
+	}
+
+	lower := strings.ToLower(task)
+	pathValue := ""
+	if index := strings.LastIndex(lower, " in "); index >= 0 {
+		pathValue = sanitizeTaskPath(strings.TrimSpace(task[index+4:]))
+	} else {
+		pathValue = sanitizeTaskPath(strings.TrimSpace(strings.TrimPrefix(task, "read ")))
+	}
+	if pathValue == "" {
+		return raw
+	}
+
+	payload, err := json.Marshal(map[string]string{"path": pathValue})
+	if err != nil {
+		return raw
+	}
+	return payload
+}
+
+func sanitizeTaskPath(value string) string {
+	clean := strings.TrimSpace(value)
+	clean = strings.Trim(clean, "\"'`")
+	clean = strings.TrimRight(clean, "?.!,;:")
+	return clean
+}
+
+func extractDaysWindow(taskLower string, fallback int) int {
+	fields := strings.Fields(taskLower)
+	for index, token := range fields {
+		if token == "last" || token == "over" {
+			for seek := index + 1; seek < len(fields) && seek <= index+4; seek++ {
+				value, err := strconv.Atoi(strings.Trim(fields[seek], " ,.;:"))
+				if err == nil && value > 0 && value <= 365 {
+					return value
+				}
+			}
+		}
+	}
+	return fallback
+}
+
+type noteFile struct {
+	path    string
+	modTime time.Time
+}
+
+func collectRecentNotePaths(allowedDirs []string, days, limit int) ([]string, error) {
+	if days <= 0 {
+		days = 10
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+
+	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+	files := make([]noteFile, 0, 32)
+
+	searchDirs := noteLikelyDirs(allowedDirs)
+	if len(searchDirs) == 0 {
+		return nil, nil
+	}
+
+	for _, allowedDir := range searchDirs {
+		err := filepath.WalkDir(allowedDir, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			name := entry.Name()
+			if strings.HasPrefix(name, ".") {
+				if entry.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			ext := strings.ToLower(filepath.Ext(name))
+			if ext != ".md" && ext != ".txt" {
+				return nil
+			}
+
+			info, infoErr := entry.Info()
+			if infoErr != nil {
+				return nil
+			}
+			if info.ModTime().Before(cutoff) {
+				return nil
+			}
+
+			files = append(files, noteFile{
+				path:    path,
+				modTime: info.ModTime(),
+			})
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].modTime.Equal(files[j].modTime) {
+			return files[i].path < files[j].path
+		}
+		return files[i].modTime.After(files[j].modTime)
+	})
+
+	if len(files) > limit {
+		files = files[:limit]
+	}
+
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		paths = append(paths, file.path)
+	}
+	return paths, nil
+}
+
+func noteLikelyDirs(allowedDirs []string) []string {
+	dirs := make([]string, 0, len(allowedDirs))
+	for _, dir := range allowedDirs {
+		base := strings.ToLower(filepath.Base(dir))
+		if strings.Contains(base, "note") {
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
+}
+
+func isHelpRequest(taskLower string) bool {
+	return taskLower == "help" ||
+		strings.Contains(taskLower, "what can you do") ||
+		strings.Contains(taskLower, "how do i use") ||
+		strings.Contains(taskLower, "how to use otter")
+}
+
+func isAccessListRequest(taskLower string) bool {
+	return strings.Contains(taskLower, "what directories") ||
+		strings.Contains(taskLower, "what folders") ||
+		strings.Contains(taskLower, "what can otter access") ||
+		strings.Contains(taskLower, "show access")
+}
+
+func isAccessAddRequest(taskLower string) bool {
+	return strings.Contains(taskLower, "have access to") ||
+		strings.Contains(taskLower, "allow access to") ||
+		strings.Contains(taskLower, "grant access to") ||
+		strings.Contains(taskLower, "add access to") ||
+		strings.Contains(taskLower, "give otter access")
+}
+
+func (o *Orchestrator) listAccessMessage() string {
+	if len(o.allowedDirs) == 0 {
+		return "Otter currently has no allowed directories configured.\n\n" + o.accessGuidance()
+	}
+	lines := make([]string, 0, len(o.allowedDirs))
+	for _, dir := range o.allowedDirs {
+		lines = append(lines, "- "+dir)
+	}
+	return "Current allowed directories:\n" + strings.Join(lines, "\n")
+}
+
+func (o *Orchestrator) addAccessFromTask(task string) (string, error) {
+	requested, err := extractAccessTargets(task)
+	if err != nil {
+		return "", err
+	}
+	if len(requested) == 0 {
+		return "", fmt.Errorf("I couldn't detect any valid directories in that request. Try: otter \"give otter access to ~/Desktop and ~/Documents\"")
+	}
+
+	cfg, err := settings.Load()
+	if err != nil {
+		return "", fmt.Errorf("failed to load otter settings: %w", err)
+	}
+	merged := mergeDirs(o.allowedDirs, cfg.AllowedDirs)
+
+	added := make([]string, 0, len(requested))
+	alreadyAllowed := make([]string, 0, len(requested))
+	for _, candidate := range requested {
+		resolved, resolveErr := tools.ResolvePath(candidate)
+		if resolveErr != nil {
+			continue
+		}
+		info, statErr := os.Stat(resolved)
+		if statErr != nil || !info.IsDir() {
+			continue
+		}
+		if !containsDir(merged, resolved) {
+			merged = append(merged, resolved)
+			added = append(added, resolved)
+		} else {
+			alreadyAllowed = append(alreadyAllowed, resolved)
+		}
+	}
+
+	if len(added) == 0 {
+		if len(alreadyAllowed) > 0 {
+			lines := make([]string, 0, len(alreadyAllowed))
+			for _, dir := range alreadyAllowed {
+				lines = append(lines, "- "+dir)
+			}
+			return "Those directories are already allowed:\n" + strings.Join(lines, "\n"), nil
+		}
+		return "", fmt.Errorf("I couldn't add any existing directories from that request.\n\n%s", o.accessGuidance())
+	}
+
+	cfg.AllowedDirs = merged
+	if err := settings.Save(cfg); err != nil {
+		return "", fmt.Errorf("failed to save otter settings: %w", err)
+	}
+
+	o.allowedDirs = merged
+	lines := make([]string, 0, len(added))
+	for _, dir := range added {
+		lines = append(lines, "- "+dir)
+	}
+	return "Added directory access:\n" + strings.Join(lines, "\n"), nil
+}
+
+func (o *Orchestrator) accessGuidance() string {
+	return "You can grant access with prompts like:\n" +
+		"- otter \"give otter access to Desktop and Documents\"\n" +
+		"- otter \"allow access to ~/Work\"\n" +
+		"Then verify with:\n" +
+		"- otter \"what directories can otter access?\""
+}
+
+func (o *Orchestrator) helpMessage() string {
+	return "I can currently:\n" +
+		"- list files in a folder\n" +
+		"- read text files\n" +
+		"- summarize note files\n\n" +
+		"Examples:\n" +
+		"- otter \"list files in ~/Downloads\"\n" +
+		"- otter \"read ~/notes/today.md\"\n" +
+		"- otter \"Read my latest notes over the last 10 days\"\n\n" +
+		o.accessGuidance()
+}
+
+func extractAccessTargets(task string) ([]string, error) {
+	lower := strings.ToLower(task)
+	normalized := strings.NewReplacer(",", " ", ";", " ", " and ", " ", " or ", " ").Replace(task)
+	parts := strings.Fields(normalized)
+
+	targets := make([]string, 0, 8)
+	for _, token := range parts {
+		clean := strings.Trim(token, "\"'`")
+		if clean == "" {
+			continue
+		}
+		if strings.HasPrefix(clean, "~/") || strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "$HOME/") {
+			targets = append(targets, clean)
+		}
+	}
+
+	homeShortcuts := map[string]string{
+		"desktop":   "~/Desktop",
+		"documents": "~/Documents",
+		"downloads": "~/Downloads",
+		"notes":     "~/notes",
+		"pictures":  "~/Pictures",
+		"music":     "~/Music",
+		"movies":    "~/Movies",
+	}
+	for keyword, path := range homeShortcuts {
+		if strings.Contains(lower, keyword) {
+			targets = append(targets, path)
+		}
+	}
+
+	return uniqueStrings(targets), nil
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func mergeDirs(groups ...[]string) []string {
+	merged := make([]string, 0)
+	for _, group := range groups {
+		for _, item := range group {
+			if !containsDir(merged, item) {
+				merged = append(merged, item)
+			}
+		}
+	}
+	return merged
+}
+
+func containsDir(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
 }

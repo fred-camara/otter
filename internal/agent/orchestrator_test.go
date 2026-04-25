@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -78,7 +79,8 @@ func TestNormalizeToolNameAliases(t *testing.T) {
 }
 
 func TestDirectToolCallForTaskListFiles(t *testing.T) {
-	call, ok := directToolCallForTask("list files in ~/Downloads")
+	orch := &Orchestrator{allowedDirs: []string{"."}}
+	call, ok := orch.directToolCallForTask("list files in ~/Downloads")
 	if !ok {
 		t.Fatalf("expected direct tool call")
 	}
@@ -87,5 +89,105 @@ func TestDirectToolCallForTaskListFiles(t *testing.T) {
 	}
 	if !strings.Contains(string(call.Input), `"~/Downloads"`) {
 		t.Fatalf("expected path in input, got %s", string(call.Input))
+	}
+}
+
+func TestDirectToolCallForLatestNotes(t *testing.T) {
+	root := t.TempDir()
+	notesDir := filepath.Join(root, "notes")
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatalf("mkdir notes: %v", err)
+	}
+
+	recentPath := filepath.Join(notesDir, "recent.md")
+	if err := os.WriteFile(recentPath, []byte("recent note"), 0o644); err != nil {
+		t.Fatalf("write recent.md: %v", err)
+	}
+
+	orch := &Orchestrator{allowedDirs: []string{notesDir}}
+	call, ok := orch.directToolCallForTask("Read my latest notes over the last 10 days")
+	if !ok {
+		t.Fatalf("expected direct tool call")
+	}
+	if call.Tool != "summarize_files" {
+		t.Fatalf("expected summarize_files, got %q", call.Tool)
+	}
+	if !strings.Contains(string(call.Input), "recent.md") {
+		t.Fatalf("expected recent note in tool input, got %s", string(call.Input))
+	}
+}
+
+func TestDirectToolCallForAccessAddDesktop(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	home := t.TempDir()
+	desktop := filepath.Join(home, "Desktop")
+	if err := os.MkdirAll(desktop, 0o755); err != nil {
+		t.Fatalf("mkdir desktop: %v", err)
+	}
+	t.Setenv("HOME", home)
+
+	orch := &Orchestrator{allowedDirs: []string{}}
+	call, ok := orch.directToolCallForTask("I'd like otter to have access to Desktop")
+	if !ok {
+		t.Fatalf("expected direct tool call")
+	}
+	if !strings.Contains(call.Error, "Added directory access") {
+		t.Fatalf("expected access-added message, got %q", call.Error)
+	}
+	if !strings.Contains(call.Error, desktop) {
+		t.Fatalf("expected desktop path in message, got %q", call.Error)
+	}
+}
+
+func TestDirectToolCallForAccessList(t *testing.T) {
+	orch := &Orchestrator{allowedDirs: []string{"/tmp/a", "/tmp/b"}}
+	call, ok := orch.directToolCallForTask("what directories can otter access?")
+	if !ok {
+		t.Fatalf("expected direct tool call")
+	}
+	if !strings.Contains(call.Error, "/tmp/a") || !strings.Contains(call.Error, "/tmp/b") {
+		t.Fatalf("expected both directories in access list, got %q", call.Error)
+	}
+}
+
+func TestInferSafeToolFromTask(t *testing.T) {
+	if got := inferSafeToolFromTask("show files in my downloads"); got != "list_files" {
+		t.Fatalf("expected list_files, got %q", got)
+	}
+	if got := inferSafeToolFromTask("open this file"); got != "read_file" {
+		t.Fatalf("expected read_file, got %q", got)
+	}
+	if got := inferSafeToolFromTask("summarize these notes"); got != "summarize_files" {
+		t.Fatalf("expected summarize_files, got %q", got)
+	}
+}
+
+func TestDirectToolCallForHelp(t *testing.T) {
+	orch := &Orchestrator{allowedDirs: []string{"."}}
+	call, ok := orch.directToolCallForTask("help")
+	if !ok {
+		t.Fatalf("expected direct tool call")
+	}
+	if !strings.Contains(call.Error, "I can currently") {
+		t.Fatalf("expected help response, got %q", call.Error)
+	}
+}
+
+func TestExecuteToolCallShowsAccessGuidance(t *testing.T) {
+	root := t.TempDir()
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	call := ToolCall{
+		Tool:  "list_files",
+		Input: json.RawMessage(`{"path":"/tmp"}`),
+	}
+	result := orch.executeToolCall("list files in /tmp", call)
+	if !strings.Contains(result, "grant access") {
+		t.Fatalf("expected access guidance, got: %s", result)
 	}
 }

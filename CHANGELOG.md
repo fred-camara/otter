@@ -7,3 +7,4 @@
 - Implemented safe tools: `list_files`, `read_file`, `summarize_files`.
 - Added permission gating, tests, and install flow for `otter` command.
 - Added path expansion support for `~` and `$HOME` in tool inputs.
+- Added natural-language directory access management with persisted config (`~/.config/otter/config.json`).

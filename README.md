@@ -63,6 +63,8 @@ curl -sS -X POST http://127.0.0.1:8080/run \
 ```bash
 otter "list files in $HOME/Downloads"
 otter "summarize files $HOME/notes/today.md and $HOME/notes/todo.md"
+otter "give otter access to Desktop and Documents"
+otter "what directories can otter access?"
 ```
 
 `~` and `$HOME` paths are supported in tool inputs.
@@ -71,6 +73,18 @@ otter "summarize files $HOME/notes/today.md and $HOME/notes/todo.md"
 
 - `otter "task"` sends tasks to the local model planner.
 - `otter serve` starts the local HTTP server.
+
+## Directory access configuration
+
+Otter now supports natural-language access management in CLI prompts:
+
+- `otter "give otter access to Desktop"`
+- `otter "allow access to ~/Work and ~/Projects"`
+- `otter "what directories can otter access?"`
+- `otter "help"` for quick usage guidance
+
+Access rules are persisted in `~/.config/otter/config.json` (or `OTTER_CONFIG_FILE`).
+If `OTTER_ALLOWED_DIRS` is set, it is merged with persisted access for that run.
 
 ## Current safety scope
 
