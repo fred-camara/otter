@@ -8,3 +8,4 @@
 - Added permission gating, tests, and install flow for `otter` command.
 - Added path expansion support for `~` and `$HOME` in tool inputs.
 - Added natural-language directory access management with persisted config (`~/.config/otter/config.json`).
+- Improved notes intent handling (`access my notes`, latest-notes scanning fallback, and clearer Apple Notes guidance).

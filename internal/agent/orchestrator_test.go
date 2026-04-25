@@ -164,6 +164,29 @@ func TestInferSafeToolFromTask(t *testing.T) {
 	}
 }
 
+func TestExtractAccessTargetsNotesIncludesCommonPaths(t *testing.T) {
+	targets, err := extractAccessTargets("access my notes")
+	if err != nil {
+		t.Fatalf("extractAccessTargets error: %v", err)
+	}
+	joined := strings.Join(targets, "|")
+	if !strings.Contains(joined, "~/notes") {
+		t.Fatalf("expected ~/notes target, got %v", targets)
+	}
+	if !strings.Contains(joined, "~/Documents/Notes") {
+		t.Fatalf("expected ~/Documents/Notes target, got %v", targets)
+	}
+}
+
+func TestLooksLikeNoteFile(t *testing.T) {
+	if !looksLikeNoteFile("/tmp/daily_notes.md") {
+		t.Fatalf("expected notes filename to match")
+	}
+	if looksLikeNoteFile("/tmp/random.txt") {
+		t.Fatalf("did not expect random filename to match")
+	}
+}
+
 func TestDirectToolCallForHelp(t *testing.T) {
 	orch := &Orchestrator{allowedDirs: []string{"."}}
 	call, ok := orch.directToolCallForTask("help")

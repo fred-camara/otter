@@ -80,11 +80,14 @@ Otter now supports natural-language access management in CLI prompts:
 
 - `otter "give otter access to Desktop"`
 - `otter "allow access to ~/Work and ~/Projects"`
+- `otter "access my notes"` (adds common notes folders)
 - `otter "what directories can otter access?"`
 - `otter "help"` for quick usage guidance
 
 Access rules are persisted in `~/.config/otter/config.json` (or `OTTER_CONFIG_FILE`).
 If `OTTER_ALLOWED_DIRS` is set, it is merged with persisted access for that run.
+
+Note: Otter currently reads note files from folders (`.md`/`.txt`). Direct Apple Notes app database access is not implemented yet.
 
 ## Current safety scope
 

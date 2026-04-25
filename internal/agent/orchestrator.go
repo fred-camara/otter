@@ -281,6 +281,9 @@ func (o *Orchestrator) directToolCallForTask(task string) (ToolCall, bool) {
 	if isHelpRequest(lowered) {
 		return ToolCall{Error: o.helpMessage()}, true
 	}
+	if strings.Contains(lowered, "apple notes") && strings.Contains(lowered, "access") {
+		return ToolCall{Error: appleNotesGuidance()}, true
+	}
 	if isAccessListRequest(lowered) {
 		return ToolCall{Error: o.listAccessMessage()}, true
 	}
@@ -299,7 +302,7 @@ func (o *Orchestrator) directToolCallForTask(task string) (ToolCall, bool) {
 			return ToolCall{Error: fmt.Sprintf("I couldn't scan your notes safely: %v", err)}, true
 		}
 		if len(paths) == 0 {
-			return ToolCall{Error: fmt.Sprintf("I couldn't find note files from the last %d days in allowed directories.", days)}, true
+			return ToolCall{Error: fmt.Sprintf("I couldn't find note files from the last %d days in allowed directories.\n\n%s", days, notesAccessGuidance())}, true
 		}
 		input, _ := json.Marshal(map[string][]string{"paths": paths})
 		return ToolCall{Tool: "summarize_files", Input: input}, true
@@ -451,13 +454,15 @@ func collectRecentNotePaths(allowedDirs []string, days, limit int) ([]string, er
 
 	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
 	files := make([]noteFile, 0, 32)
+	seenPaths := make(map[string]struct{}, 64)
 
 	searchDirs := noteLikelyDirs(allowedDirs)
 	if len(searchDirs) == 0 {
-		return nil, nil
+		searchDirs = allowedDirs
 	}
 
 	for _, allowedDir := range searchDirs {
+		broadFallback := !isLikelyNotesDir(allowedDir)
 		err := filepath.WalkDir(allowedDir, func(path string, entry os.DirEntry, err error) error {
 			if err != nil {
 				return nil
@@ -476,6 +481,9 @@ func collectRecentNotePaths(allowedDirs []string, days, limit int) ([]string, er
 			if ext != ".md" && ext != ".txt" {
 				return nil
 			}
+			if broadFallback && !looksLikeNoteFile(path) {
+				return nil
+			}
 
 			info, infoErr := entry.Info()
 			if infoErr != nil {
@@ -485,8 +493,14 @@ func collectRecentNotePaths(allowedDirs []string, days, limit int) ([]string, er
 				return nil
 			}
 
+			cleanPath := filepath.Clean(path)
+			if _, exists := seenPaths[cleanPath]; exists {
+				return nil
+			}
+			seenPaths[cleanPath] = struct{}{}
+
 			files = append(files, noteFile{
-				path:    path,
+				path:    cleanPath,
 				modTime: info.ModTime(),
 			})
 			return nil
@@ -517,12 +531,32 @@ func collectRecentNotePaths(allowedDirs []string, days, limit int) ([]string, er
 func noteLikelyDirs(allowedDirs []string) []string {
 	dirs := make([]string, 0, len(allowedDirs))
 	for _, dir := range allowedDirs {
-		base := strings.ToLower(filepath.Base(dir))
-		if strings.Contains(base, "note") {
+		if isLikelyNotesDir(dir) {
 			dirs = append(dirs, dir)
 		}
 	}
 	return dirs
+}
+
+func isLikelyNotesDir(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	return strings.Contains(base, "note") ||
+		strings.Contains(base, "journal") ||
+		strings.Contains(base, "second brain")
+}
+
+func looksLikeNoteFile(path string) bool {
+	lower := strings.ToLower(path)
+	if strings.Contains(lower, "changelog") || strings.Contains(lower, "readme") {
+		return false
+	}
+	keywords := []string{"note", "journal", "meeting", "todo", "daily"}
+	for _, keyword := range keywords {
+		if strings.Contains(lower, keyword) {
+			return true
+		}
+	}
+	return false
 }
 
 func isHelpRequest(taskLower string) bool {
@@ -544,7 +578,8 @@ func isAccessAddRequest(taskLower string) bool {
 		strings.Contains(taskLower, "allow access to") ||
 		strings.Contains(taskLower, "grant access to") ||
 		strings.Contains(taskLower, "add access to") ||
-		strings.Contains(taskLower, "give otter access")
+		strings.Contains(taskLower, "give otter access") ||
+		(strings.Contains(taskLower, "access") && strings.Contains(taskLower, "notes"))
 }
 
 func (o *Orchestrator) listAccessMessage() string {
@@ -600,6 +635,9 @@ func (o *Orchestrator) addAccessFromTask(task string) (string, error) {
 			}
 			return "Those directories are already allowed:\n" + strings.Join(lines, "\n"), nil
 		}
+		if strings.Contains(strings.ToLower(task), "notes") {
+			return "", fmt.Errorf("I couldn't find a notes directory to add.\n\n%s", notesAccessGuidance())
+		}
 		return "", fmt.Errorf("I couldn't add any existing directories from that request.\n\n%s", o.accessGuidance())
 	}
 
@@ -620,8 +658,21 @@ func (o *Orchestrator) accessGuidance() string {
 	return "You can grant access with prompts like:\n" +
 		"- otter \"give otter access to Desktop and Documents\"\n" +
 		"- otter \"allow access to ~/Work\"\n" +
+		"- otter \"give otter access to notes\"\n" +
 		"Then verify with:\n" +
 		"- otter \"what directories can otter access?\""
+}
+
+func notesAccessGuidance() string {
+	return "Try one of these:\n" +
+		"- otter \"give otter access to ~/notes\"\n" +
+		"- otter \"give otter access to ~/Documents/Notes\"\n" +
+		"- otter \"give otter access to ~/Library/Mobile Documents/com~apple~CloudDocs/Notes\"\n\n" +
+		"Otter currently reads note files from folders (.md/.txt). Apple Notes app database access is not implemented yet."
+}
+
+func appleNotesGuidance() string {
+	return "Otter currently reads note files from folders (.md/.txt), not the Apple Notes app database.\n\n" + notesAccessGuidance()
 }
 
 func (o *Orchestrator) helpMessage() string {
@@ -653,18 +704,28 @@ func extractAccessTargets(task string) ([]string, error) {
 	}
 
 	homeShortcuts := map[string]string{
-		"desktop":   "~/Desktop",
-		"documents": "~/Documents",
-		"downloads": "~/Downloads",
-		"notes":     "~/notes",
-		"pictures":  "~/Pictures",
-		"music":     "~/Music",
-		"movies":    "~/Movies",
+		"desktop":     "~/Desktop",
+		"documents":   "~/Documents",
+		"downloads":   "~/Downloads",
+		"notes":       "~/notes",
+		"apple notes": "~/Library/Mobile Documents/com~apple~CloudDocs/Notes",
+		"pictures":    "~/Pictures",
+		"music":       "~/Music",
+		"movies":      "~/Movies",
 	}
 	for keyword, path := range homeShortcuts {
 		if strings.Contains(lower, keyword) {
 			targets = append(targets, path)
 		}
+	}
+
+	if strings.Contains(lower, "notes") {
+		targets = append(targets,
+			"~/notes",
+			"~/Documents/Notes",
+			"~/Documents/notes",
+			"~/Library/Mobile Documents/com~apple~CloudDocs/Notes",
+		)
 	}
 
 	return uniqueStrings(targets), nil
