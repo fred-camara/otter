@@ -1,12 +1,16 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"otter/internal/planner"
+	"otter/internal/recovery"
 )
 
 type stubPlanner struct {
@@ -14,7 +18,19 @@ type stubPlanner struct {
 	err    error
 }
 
-func (s stubPlanner) Plan(_ string, _ []string) (string, error) {
+type stubModelGenerator struct {
+	output string
+	err    error
+}
+
+func (s stubPlanner) Plan(_ context.Context, _ planner.Request) (planner.Response, error) {
+	if s.err != nil {
+		return planner.Response{}, s.err
+	}
+	return planner.Response{RawJSON: s.output}, nil
+}
+
+func (s stubModelGenerator) Generate(_ string) (string, error) {
 	if s.err != nil {
 		return "", s.err
 	}
@@ -114,6 +130,156 @@ func TestDirectToolCallForLatestNotes(t *testing.T) {
 	}
 	if !strings.Contains(string(call.Input), "recent.md") {
 		t.Fatalf("expected recent note in tool input, got %s", string(call.Input))
+	}
+}
+
+func TestDirectToolCallForSummarizeThisFile(t *testing.T) {
+	orch := &Orchestrator{allowedDirs: []string{"."}}
+	call, ok := orch.directToolCallForTask("summarize this file: ~/Downloads/CV_Frederic_Camara_2025.pdf")
+	if !ok {
+		t.Fatalf("expected direct summarize tool call")
+	}
+	if call.Tool != "summarize_files" {
+		t.Fatalf("expected summarize_files, got %q", call.Tool)
+	}
+	if !strings.Contains(string(call.Input), "CV_Frederic_Camara_2025.pdf") {
+		t.Fatalf("expected file path in input, got %s", string(call.Input))
+	}
+}
+
+func TestDirectToolCallForSummarizeThisFileWithoutColon(t *testing.T) {
+	orch := &Orchestrator{allowedDirs: []string{"."}}
+	call, ok := orch.directToolCallForTask("summarize this file CV_Frederic_Camara_2025.pdf")
+	if !ok {
+		t.Fatalf("expected direct summarize tool call")
+	}
+	if call.Tool != "summarize_files" {
+		t.Fatalf("expected summarize_files, got %q", call.Tool)
+	}
+	if !strings.Contains(string(call.Input), "CV_Frederic_Camara_2025.pdf") {
+		t.Fatalf("expected file path in input, got %s", string(call.Input))
+	}
+	if strings.Contains(string(call.Input), "this file") {
+		t.Fatalf("should strip conversational prefix, got %s", string(call.Input))
+	}
+}
+
+func TestRunSummarizeThisFilePdfReturnsToolErrorInsteadOfPlannerJSONError(t *testing.T) {
+	root := t.TempDir()
+	pdfPath := filepath.Join(root, "CV_Frederic_Camara_2025.pdf")
+	if err := os.WriteFile(pdfPath, []byte{0x25, 0x50, 0x44, 0x46, 0x00}, 0o644); err != nil {
+		t.Fatalf("seed pdf: %v", err)
+	}
+
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{output: `not json`})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.Run("summarize this file: " + pdfPath)
+	if strings.Contains(strings.ToLower(result), "planner returned invalid json") {
+		t.Fatalf("expected direct tool path, got planner JSON error: %s", result)
+	}
+	lower := strings.ToLower(result)
+	if !strings.Contains(lower, "read pdf") && !strings.Contains(lower, "binary files are not supported") {
+		t.Fatalf("expected direct summarize tool error for pdf input, got: %s", result)
+	}
+}
+
+func TestSummarizeThisFileResolvesBareFilenameInAllowedDirs(t *testing.T) {
+	root := t.TempDir()
+	deep := filepath.Join(root, "docs", "cv")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	file := filepath.Join(deep, "cv.txt")
+	if err := os.WriteFile(file, []byte("hello\nworld"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{output: `not json`})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.Run("summarize this file: cv.txt")
+	if strings.Contains(strings.ToLower(result), "planner returned invalid json") {
+		t.Fatalf("should not hit planner json path: %s", result)
+	}
+	if !strings.Contains(result, "Summary:") || !strings.Contains(result, "cv.txt") {
+		t.Fatalf("expected summary output for resolved file, got: %s", result)
+	}
+}
+
+func TestRunSummarizeUsesModelOutputWhenAvailable(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "cv.txt")
+	if err := os.WriteFile(file, []byte("Frederic Camara\nStaff engineer"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{output: `not json`})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	orch.modelGen = stubModelGenerator{output: "Model summary output"}
+
+	result := orch.Run("summarize this file: cv.txt")
+	if !strings.Contains(result, "Model summary output") {
+		t.Fatalf("expected model output, got: %s", result)
+	}
+}
+
+func TestRunSummarizeShowsExplicitFallbackWhenModelFails(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "cv.txt")
+	if err := os.WriteFile(file, []byte("Frederic Camara\nStaff engineer"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{output: `not json`})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	orch.modelGen = stubModelGenerator{err: fmt.Errorf("ollama unavailable")}
+
+	result := orch.Run("summarize this file: cv.txt")
+	if !strings.Contains(result, "Model summary unavailable: ollama unavailable") {
+		t.Fatalf("expected explicit model fallback reason, got: %s", result)
+	}
+	if !strings.Contains(result, "Using tool-based fallback.") {
+		t.Fatalf("expected fallback marker, got: %s", result)
+	}
+	if !strings.Contains(result, "Summary:") {
+		t.Fatalf("expected fallback summary body, got: %s", result)
+	}
+}
+
+func TestSummarizeThisFileErrorsOnAmbiguousBareFilename(t *testing.T) {
+	root := t.TempDir()
+	firstDir := filepath.Join(root, "a")
+	secondDir := filepath.Join(root, "b")
+	if err := os.MkdirAll(firstDir, 0o755); err != nil {
+		t.Fatalf("mkdir a: %v", err)
+	}
+	if err := os.MkdirAll(secondDir, 0o755); err != nil {
+		t.Fatalf("mkdir b: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(firstDir, "duplicate.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write a duplicate: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(secondDir, "duplicate.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatalf("write b duplicate: %v", err)
+	}
+
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{output: `not json`})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.Run("summarize this file: duplicate.txt")
+	if !strings.Contains(strings.ToLower(result), "multiple files named") {
+		t.Fatalf("expected ambiguity message, got: %s", result)
 	}
 }
 
@@ -341,6 +507,74 @@ func TestRunOrganizeMusicConfirmFlagDoesNotBecomeFolder(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(downloads, "Audio", "song.mp3")); err != nil {
 		t.Fatalf("expected moved file in Audio folder: %v", err)
+	}
+}
+
+func TestRunRecoveryModeCreatesDryRunPlanFiles(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "audio", "mix")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+	source := filepath.Join(nested, "mystery.zzz")
+	if err := os.WriteFile(source, []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.Run("recover file structure in " + root)
+	if !strings.Contains(result, "dry-run only") {
+		t.Fatalf("expected dry-run response, got: %s", result)
+	}
+
+	jsonPath := filepath.Join(root, "recovery_plan.json")
+	mdPath := filepath.Join(root, "recovery_plan.md")
+	if _, err := os.Stat(jsonPath); err != nil {
+		t.Fatalf("expected recovery json to be created: %v", err)
+	}
+	if _, err := os.Stat(mdPath); err != nil {
+		t.Fatalf("expected recovery markdown to be created: %v", err)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("source file should remain in place: %v", err)
+	}
+}
+
+func TestRunRecoveryModeUsesLogSignals(t *testing.T) {
+	root := t.TempDir()
+	current := filepath.Join(root, "organized", "a.wav")
+	if err := os.MkdirAll(filepath.Dir(current), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(current, []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	task := fmt.Sprintf("create recovery plan for %s ; %s -> %s", root, filepath.Join(root, "original", "pack", "a.wav"), current)
+	_ = orch.Run(task)
+
+	data, err := os.ReadFile(filepath.Join(root, "recovery_plan.json"))
+	if err != nil {
+		t.Fatalf("read recovery plan json: %v", err)
+	}
+	var plan recovery.Plan
+	if err := json.Unmarshal(data, &plan); err != nil {
+		t.Fatalf("parse recovery plan: %v", err)
+	}
+	if len(plan.Entries) != 1 {
+		t.Fatalf("expected one plan entry, got %d", len(plan.Entries))
+	}
+	if plan.Entries[0].Confidence != recovery.ConfidenceHigh {
+		t.Fatalf("expected high confidence from logs, got %s", plan.Entries[0].Confidence)
 	}
 }
 

@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	pdf "github.com/dslipak/pdf"
 )
 
 type SummarizeFilesTool struct {
@@ -60,22 +63,10 @@ func (t *SummarizeFilesTool) Execute(input json.RawMessage) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("resolve path %q: %w", pathValue, err)
 		}
-		if !isPathAllowed(absPath, t.allowedDirs) {
-			return "", fmt.Errorf("path is outside allowed directories: %s", absPath)
-		}
-		if isHiddenPath(absPath) {
-			return "", fmt.Errorf("hidden paths are not allowed: %s", absPath)
-		}
-
-		content, err := os.ReadFile(absPath)
+		text, err := ExtractSummarizableText(absPath, t.allowedDirs)
 		if err != nil {
-			return "", fmt.Errorf("read file %s: %w", absPath, err)
+			return "", err
 		}
-		if !isTextLike(content) {
-			return "", fmt.Errorf("binary files are not supported: %s", absPath)
-		}
-
-		text := strings.TrimSpace(string(content))
 		summaryLine := summarizeText(filepath.Base(absPath), text)
 		lines = append(lines, summaryLine)
 	}
@@ -85,6 +76,86 @@ func (t *SummarizeFilesTool) Execute(input json.RawMessage) (string, error) {
 	}
 
 	return "Summary:\n- " + strings.Join(lines, "\n- "), nil
+}
+
+func ExtractSummarizableText(path string, allowedDirs []string) (string, error) {
+	absPath, err := ResolvePath(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve path %q: %w", path, err)
+	}
+	if !isPathAllowed(absPath, allowedDirs) {
+		return "", fmt.Errorf("path is outside allowed directories: %s", absPath)
+	}
+	if isHiddenPath(absPath) {
+		return "", fmt.Errorf("hidden paths are not allowed: %s", absPath)
+	}
+
+	content, err := os.ReadFile(absPath)
+	if err != nil {
+		return "", fmt.Errorf("read file %s: %w", absPath, err)
+	}
+
+	var text string
+	if strings.EqualFold(filepath.Ext(absPath), ".pdf") {
+		text, err = extractPDFText(absPath)
+		if err != nil {
+			return "", fmt.Errorf("read pdf %s: %w", absPath, err)
+		}
+		if strings.TrimSpace(text) == "" {
+			return "", fmt.Errorf("pdf has no extractable text: %s", absPath)
+		}
+	} else {
+		if !isTextLike(content) {
+			return "", fmt.Errorf("binary files are not supported: %s", absPath)
+		}
+		text = string(content)
+	}
+
+	text = sanitizeExtractedText(text)
+	if strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("file has no usable text content: %s", absPath)
+	}
+	if len(text) > 64000 {
+		text = text[:64000]
+	}
+	return strings.TrimSpace(text), nil
+}
+
+func extractPDFText(path string) (string, error) {
+	reader, err := pdf.Open(path)
+	if err != nil {
+		return "", err
+	}
+	plainTextReader, err := reader.GetPlainText()
+	if err != nil {
+		return "", err
+	}
+	raw, err := io.ReadAll(io.LimitReader(plainTextReader, 4<<20))
+	if err != nil {
+		return "", err
+	}
+
+	text := strings.TrimSpace(string(raw))
+	if len(text) > 64000 {
+		text = text[:64000]
+	}
+	return text, nil
+}
+
+func sanitizeExtractedText(text string) string {
+	text = strings.ReplaceAll(text, "\x00", "")
+	builder := strings.Builder{}
+	builder.Grow(len(text))
+	for _, r := range text {
+		if r == '\n' || r == '\r' || r == '\t' || (r >= 32 && r != 127) {
+			builder.WriteRune(r)
+			continue
+		}
+		builder.WriteRune(' ')
+	}
+	clean := strings.ReplaceAll(builder.String(), "\r\n", "\n")
+	clean = strings.ReplaceAll(clean, "\r", "\n")
+	return clean
 }
 
 func summarizeText(name, text string) string {

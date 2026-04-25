@@ -15,6 +15,7 @@ const defaultRelativeConfigPath = ".config/otter/config.json"
 
 type Config struct {
 	AllowedDirs []string `json:"allowed_dirs"`
+	Model       string   `json:"model,omitempty"`
 }
 
 func Load() (Config, error) {
@@ -36,6 +37,7 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.AllowedDirs = normalize(cfg.AllowedDirs)
+	cfg.Model = strings.TrimSpace(cfg.Model)
 	return cfg, nil
 }
 
@@ -46,6 +48,7 @@ func Save(cfg Config) error {
 	}
 
 	cfg.AllowedDirs = normalize(cfg.AllowedDirs)
+	cfg.Model = strings.TrimSpace(cfg.Model)
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)

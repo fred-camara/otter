@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 
 	"otter/internal/model"
 	"otter/internal/permissions"
+	"otter/internal/planner"
+	"otter/internal/recovery"
 	"otter/internal/settings"
 	"otter/internal/tools"
 )
@@ -27,15 +30,12 @@ const (
 
 type Orchestrator struct {
 	registry    *tools.Registry
-	planner     Planner
+	planner     planner.Planner
+	modelGen    model.Interface
 	allowedDirs []string
 }
 
-type llmPlanner struct {
-	model model.Interface
-}
-
-func NewOrchestrator(allowedDirs []string, planner Planner) (*Orchestrator, error) {
+func NewOrchestrator(allowedDirs []string, planner planner.Planner) (*Orchestrator, error) {
 	normalizedDirs, err := normalizeAllowedDirs(allowedDirs)
 	if err != nil {
 		return nil, err
@@ -74,11 +74,15 @@ func NewOrchestratorFromEnv() (*Orchestrator, error) {
 		}
 	}
 
-	modelName := firstNonEmpty(strings.TrimSpace(os.Getenv("OTTER_MODEL")), defaultModelName)
+	modelName, _ := ResolvePlannerModelName(cfg, strings.TrimSpace(os.Getenv("OTTER_MODEL")))
 	ollamaURL := firstNonEmpty(strings.TrimSpace(os.Getenv("OTTER_OLLAMA_URL")), defaultOllamaURL)
-	planner := &llmPlanner{model: model.NewOllama(modelName, ollamaURL)}
-
-	return NewOrchestrator(dirs, planner)
+	pl := planner.NewOllamaPlanner(model.NewOllama(modelName, ollamaURL))
+	orch, err := NewOrchestrator(dirs, pl)
+	if err != nil {
+		return nil, err
+	}
+	orch.modelGen = model.NewOllamaText(modelName, ollamaURL)
+	return orch, nil
 }
 
 func RunTask(task string) string {
@@ -102,6 +106,14 @@ func (o *Orchestrator) Run(task string) string {
 		return response
 	}
 
+	if response, handled := o.handleSummarizeWithModelTask(task); handled {
+		return response
+	}
+
+	if response, handled := o.handleRecoveryTask(task); handled {
+		return response
+	}
+
 	if directCall, ok := o.directToolCallForTask(task); ok {
 		return o.executeToolCall(task, directCall)
 	}
@@ -113,12 +125,15 @@ func (o *Orchestrator) Run(task string) string {
 
 	var parsed ToolCall
 	for attempt := 0; attempt <= maxPlanRetries; attempt++ {
-		raw, err := o.planner.Plan(task, toolNames)
+		resp, err := o.planner.Plan(context.Background(), planner.Request{
+			Task:  task,
+			Tools: toolNames,
+		})
 		if err != nil {
-			return fmt.Sprintf("🦦 Planner error: %v", err)
+			return plannerErrorMessage(err)
 		}
 
-		parsed, err = parseToolCall(raw)
+		parsed, err = parseToolCall(resp.RawJSON)
 		if err != nil {
 			if attempt == maxPlanRetries {
 				return fmt.Sprintf("🦦 Planner returned invalid JSON after retries: %v", err)
@@ -139,6 +154,22 @@ func (o *Orchestrator) Run(task string) string {
 	}
 
 	return o.executeToolCall(task, parsed)
+}
+
+func plannerErrorMessage(err error) string {
+	base := fmt.Sprintf("🦦 Planner error: %v", err)
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "127.0.0.1:11434") ||
+		strings.Contains(lower, "call ollama") ||
+		strings.Contains(lower, "connection refused") ||
+		strings.Contains(lower, "operation not permitted") ||
+		strings.Contains(lower, "no such host") {
+		return base + "\n\nTo enable chat/planning safely:\n" +
+			"1. Start Ollama locally (`ollama serve`).\n" +
+			"2. Ensure the model exists (`ollama pull qwen2.5-coder:14b` or set `OTTER_MODEL`).\n" +
+			"3. Verify `OTTER_OLLAMA_URL` (default `http://127.0.0.1:11434`)."
+	}
+	return base
 }
 
 func parseToolCall(raw string) (ToolCall, error) {
@@ -222,30 +253,6 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func (p *llmPlanner) Plan(task string, toolNames []string) (string, error) {
-	prompt := buildPrompt(task, toolNames)
-	return p.model.Generate(prompt)
-}
-
-func buildPrompt(task string, toolNames []string) string {
-	return fmt.Sprintf(`You are Otter, a local system agent.
-Return valid JSON only with this exact schema:
-{"tool":"tool_name","input":{}}
-If task cannot be completed safely, return:
-{"error":"reason"}
-
-Rules:
-- Use only these tools: %s
-- Never delete files
-- Never use shell commands
-- Never use network or external APIs
-- Prefer safe read/list/summarize/write/move
-- No markdown, no explanations
-- Do not include any text before or after the JSON object
-
-User task: %s`, strings.Join(toolNames, ", "), task)
-}
-
 func normalizeToolName(value string) string {
 	normalized := strings.Trim(value, " \t\r\n`\"'")
 	normalized = strings.TrimPrefix(normalized, "/")
@@ -325,6 +332,9 @@ func (o *Orchestrator) directToolCallForTask(task string) (ToolCall, bool) {
 		input, _ := json.Marshal(map[string][]string{"paths": paths})
 		return ToolCall{Tool: "summarize_files", Input: input}, true
 	}
+	if call, ok := o.summarizeToolCallFromTask(trimmed); ok {
+		return call, true
+	}
 
 	if strings.HasPrefix(lowered, "list files") {
 		pathValue := "."
@@ -358,6 +368,222 @@ func (o *Orchestrator) directToolCallForTask(task string) (ToolCall, bool) {
 	}
 
 	return ToolCall{}, false
+}
+
+func (o *Orchestrator) summarizeToolCallFromTask(task string) (ToolCall, bool) {
+	lower := strings.ToLower(strings.TrimSpace(task))
+	if !strings.Contains(lower, "summar") {
+		return ToolCall{}, false
+	}
+
+	var rawPaths []string
+	trimmed := strings.TrimSpace(task)
+
+	if strings.Contains(lower, "summarize this file:") || strings.Contains(lower, "summarise this file:") {
+		if index := strings.Index(trimmed, ":"); index >= 0 && index+1 < len(trimmed) {
+			rawPaths = append(rawPaths, strings.TrimSpace(trimmed[index+1:]))
+		}
+	} else if strings.HasPrefix(lower, "summarize files ") || strings.HasPrefix(lower, "summarise files ") {
+		chunk := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "summarize files "), "summarise files "))
+		for _, part := range strings.Split(chunk, " and ") {
+			for _, item := range strings.Split(part, ",") {
+				candidate := sanitizeTaskPath(item)
+				if candidate != "" {
+					rawPaths = append(rawPaths, candidate)
+				}
+			}
+		}
+	} else if strings.HasPrefix(lower, "summarize ") || strings.HasPrefix(lower, "summarise ") {
+		chunk := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(trimmed, "summarize "), "summarise "))
+		chunk = strings.TrimSpace(stripLeadingSummarizeFileTargetPrefix(chunk))
+		if chunk != "" && (strings.Contains(chunk, "/") || strings.Contains(chunk, "~") || strings.Contains(chunk, ".")) {
+			rawPaths = append(rawPaths, sanitizeTaskPath(chunk))
+		}
+	}
+
+	paths := uniqueStrings(rawPaths)
+	if len(paths) == 0 {
+		return ToolCall{}, false
+	}
+	resolved, err := o.resolveSummarizePaths(paths)
+	if err != nil {
+		return ToolCall{Error: err.Error()}, true
+	}
+
+	input, _ := json.Marshal(map[string][]string{"paths": resolved})
+	return ToolCall{Tool: "summarize_files", Input: input}, true
+}
+
+func stripLeadingSummarizeFileTargetPrefix(value string) string {
+	trimmed := strings.TrimSpace(value)
+	lower := strings.ToLower(trimmed)
+	prefixes := []string{
+		"this file:",
+		"this file ",
+		"the file:",
+		"the file ",
+		"file:",
+		"file ",
+	}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(lower, prefix) {
+			return strings.TrimSpace(trimmed[len(prefix):])
+		}
+	}
+	return trimmed
+}
+
+func (o *Orchestrator) handleSummarizeWithModelTask(task string) (string, bool) {
+	call, ok := o.summarizeToolCallFromTask(task)
+	if !ok {
+		return "", false
+	}
+	if strings.TrimSpace(call.Error) != "" {
+		return "🦦 " + call.Error, true
+	}
+	if call.Tool != "summarize_files" {
+		return "", false
+	}
+
+	var payload struct {
+		Paths []string `json:"paths"`
+	}
+	if err := json.Unmarshal(call.Input, &payload); err != nil || len(payload.Paths) == 0 {
+		return o.executeToolCall(task, call), true
+	}
+	if o.modelGen == nil {
+		return o.executeToolCall(task, call), true
+	}
+
+	contextByPath := make(map[string]string, len(payload.Paths))
+	for _, path := range payload.Paths {
+		text, err := tools.ExtractSummarizableText(path, o.allowedDirs)
+		if err != nil {
+			return fmt.Sprintf("🦦 Tool error: %v", err), true
+		}
+		if len(text) > 12000 {
+			text = text[:12000] + "\n...[truncated]"
+		}
+		contextByPath[path] = text
+	}
+
+	output, err := o.modelGen.Generate(buildModelSummaryPrompt(task, contextByPath))
+	if err != nil {
+		fallback := o.executeToolCall(task, call)
+		return fmt.Sprintf("🦦 Model summary unavailable: %v\nUsing tool-based fallback.\n\n%s", err, fallback), true
+	}
+	output = strings.TrimSpace(output)
+	if output == "" {
+		fallback := o.executeToolCall(task, call)
+		return "🦦 Model summary unavailable: model returned empty output.\nUsing tool-based fallback.\n\n" + fallback, true
+	}
+	return "🦦 " + output, true
+}
+
+func buildModelSummaryPrompt(task string, contextByPath map[string]string) string {
+	paths := make([]string, 0, len(contextByPath))
+	for path := range contextByPath {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	builder := strings.Builder{}
+	builder.WriteString("You are Otter. Summarize the provided file contents for the user.\n")
+	builder.WriteString("Return concise markdown with:\n")
+	builder.WriteString("- One short overview paragraph\n")
+	builder.WriteString("- Bullet points of key facts\n")
+	builder.WriteString("- Optional concerns/missing info\n\n")
+	builder.WriteString("User request: ")
+	builder.WriteString(task)
+	builder.WriteString("\n\n")
+	builder.WriteString("File contexts:\n")
+	for _, path := range paths {
+		builder.WriteString("### ")
+		builder.WriteString(path)
+		builder.WriteString("\n")
+		builder.WriteString(contextByPath[path])
+		builder.WriteString("\n\n")
+	}
+	return builder.String()
+}
+
+func (o *Orchestrator) resolveSummarizePaths(paths []string) ([]string, error) {
+	out := make([]string, 0, len(paths))
+	for _, item := range paths {
+		candidate := strings.TrimSpace(item)
+		if candidate == "" {
+			continue
+		}
+		if looksPathLike(candidate) {
+			out = append(out, candidate)
+			continue
+		}
+
+		matches, err := o.findFileByNameInAllowedDirs(candidate, 5)
+		if err != nil {
+			return nil, err
+		}
+		if len(matches) == 0 {
+			out = append(out, candidate)
+			continue
+		}
+		if len(matches) > 1 {
+			return nil, fmt.Errorf("I found multiple files named %q in allowed directories. Please provide a path.\n- %s", candidate, strings.Join(matches, "\n- "))
+		}
+		out = append(out, matches[0])
+	}
+	return out, nil
+}
+
+func (o *Orchestrator) findFileByNameInAllowedDirs(name string, limit int) ([]string, error) {
+	target := strings.ToLower(strings.TrimSpace(name))
+	if target == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 5
+	}
+	matches := make([]string, 0, 2)
+	for _, root := range o.allowedDirs {
+		err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			base := d.Name()
+			if strings.HasPrefix(base, ".") {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if strings.EqualFold(base, "recovery_plan.json") || strings.EqualFold(base, "recovery_plan.md") {
+				return nil
+			}
+			if strings.ToLower(base) == target {
+				matches = append(matches, filepath.Clean(path))
+				if len(matches) >= limit {
+					return fmt.Errorf("match limit reached")
+				}
+			}
+			return nil
+		})
+		if err != nil && !strings.Contains(err.Error(), "match limit reached") {
+			return nil, err
+		}
+	}
+	sort.Strings(matches)
+	return uniqueStrings(matches), nil
+}
+
+func looksPathLike(value string) bool {
+	clean := strings.TrimSpace(value)
+	return strings.Contains(clean, "/") ||
+		strings.Contains(clean, string(os.PathSeparator)) ||
+		strings.HasPrefix(clean, "~") ||
+		strings.HasPrefix(strings.ToLower(clean), "$home/")
 }
 
 func (o *Orchestrator) executeToolCall(task string, parsed ToolCall) string {
@@ -530,6 +756,183 @@ func isUndoRequest(taskLower string) bool {
 		strings.Contains(taskLower, "undo organize") ||
 		strings.Contains(taskLower, "undo that") ||
 		strings.Contains(taskLower, "revert last move")
+}
+
+func isRecoveryRequest(taskLower string) bool {
+	if strings.Contains(taskLower, "recovery plan") {
+		return true
+	}
+	if !strings.Contains(taskLower, "recover") {
+		return false
+	}
+	return strings.Contains(taskLower, "file") ||
+		strings.Contains(taskLower, "folder") ||
+		strings.Contains(taskLower, "structure") ||
+		strings.Contains(taskLower, "downloads") ||
+		strings.Contains(taskLower, "cymatics")
+}
+
+func (o *Orchestrator) handleRecoveryTask(task string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(task))
+	if !isRecoveryRequest(lower) {
+		return "", false
+	}
+
+	root, err := o.resolveRecoveryRoot(task)
+	if err != nil {
+		return fmt.Sprintf("🦦 I couldn't resolve recovery scope: %v", err), true
+	}
+	if !pathWithinAllowed(root, o.allowedDirs) {
+		return fmt.Sprintf("🦦 %s\n\n%s", "recovery root is outside allowed directories", o.accessGuidance()), true
+	}
+
+	logs := recovery.ParseLogEntries(task)
+	if len(logs) == 0 {
+		if history, historyErr := settings.LoadMoveHistory(); historyErr == nil {
+			for _, move := range history.Moves {
+				logs = append(logs, recovery.LogEntry{Source: move.Source, Target: move.Target})
+			}
+		}
+	}
+	logs = filterRecoveryLogsForRoot(logs, root)
+
+	plan, err := recovery.Generate(root, logs)
+	if err != nil {
+		return fmt.Sprintf("🦦 I couldn't generate a recovery plan: %v", err), true
+	}
+
+	if err := o.writeRecoveryPlan(plan); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "outside allowed directories") {
+			return fmt.Sprintf("🦦 %v\n\n%s", err, o.accessGuidance()), true
+		}
+		return fmt.Sprintf("🦦 I generated the plan but couldn't save plan files: %v", err), true
+	}
+
+	return fmt.Sprintf("🦦 Recovery plan created (dry-run only).\n- JSON: %s\n- Markdown: %s\n- Entries: %d (needs review: %d)\nNo file moves were executed.",
+		filepath.Join(root, "recovery_plan.json"),
+		filepath.Join(root, "recovery_plan.md"),
+		len(plan.Entries),
+		plan.NeedsReview,
+	), true
+}
+
+func (o *Orchestrator) resolveRecoveryRoot(task string) (string, error) {
+	if candidate := extractRecoveryPath(task); candidate != "" {
+		resolved, err := tools.ResolvePath(candidate)
+		if err != nil {
+			return "", err
+		}
+		info, err := os.Stat(resolved)
+		if err != nil {
+			return "", err
+		}
+		if !info.IsDir() {
+			return "", fmt.Errorf("recovery target must be a directory")
+		}
+		return resolved, nil
+	}
+
+	lower := strings.ToLower(task)
+	if strings.Contains(lower, "cymatics") {
+		for _, dir := range o.allowedDirs {
+			if strings.EqualFold(filepath.Base(dir), "Downloads") {
+				return dir, nil
+			}
+		}
+	}
+	if len(o.allowedDirs) == 0 {
+		return "", fmt.Errorf("no allowed directories are configured")
+	}
+	return o.allowedDirs[0], nil
+}
+
+func extractRecoveryPath(task string) string {
+	lower := strings.ToLower(task)
+	for _, marker := range []string{" in ", " for ", " under "} {
+		index := strings.LastIndex(lower, marker)
+		if index < 0 {
+			continue
+		}
+		candidate := strings.TrimSpace(task[index+len(marker):])
+		for _, stop := range []string{";", " using ", " with ", " log ", " logs ", " where "} {
+			if stopIndex := strings.Index(strings.ToLower(candidate), stop); stopIndex >= 0 {
+				candidate = strings.TrimSpace(candidate[:stopIndex])
+			}
+		}
+		candidate = sanitizeTaskPath(candidate)
+		if candidate == "" {
+			continue
+		}
+		if looksLikeOrganizeSource(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func pathWithinAllowed(path string, allowedDirs []string) bool {
+	clean := filepath.Clean(path)
+	for _, allowed := range allowedDirs {
+		if clean == allowed {
+			return true
+		}
+		if strings.HasPrefix(clean, allowed+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func filterRecoveryLogsForRoot(logs []recovery.LogEntry, root string) []recovery.LogEntry {
+	filtered := make([]recovery.LogEntry, 0, len(logs))
+	for _, entry := range logs {
+		source, sourceErr := tools.ResolvePath(entry.Source)
+		target, targetErr := tools.ResolvePath(entry.Target)
+		if sourceErr != nil || targetErr != nil {
+			continue
+		}
+		if !strings.HasPrefix(target, root+string(os.PathSeparator)) && target != root {
+			continue
+		}
+		filtered = append(filtered, recovery.LogEntry{
+			Source: source,
+			Target: target,
+		})
+	}
+	return filtered
+}
+
+func (o *Orchestrator) writeRecoveryPlan(plan recovery.Plan) error {
+	jsonText, err := recovery.PlanJSON(plan)
+	if err != nil {
+		return err
+	}
+	markdown := recovery.PlanMarkdown(plan)
+
+	jsonPath := filepath.Join(plan.RootPath, "recovery_plan.json")
+	mdPath := filepath.Join(plan.RootPath, "recovery_plan.md")
+
+	if err := o.writeTextFileWithConfirm(jsonPath, jsonText); err != nil {
+		return err
+	}
+	if err := o.writeTextFileWithConfirm(mdPath, markdown); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (o *Orchestrator) writeTextFileWithConfirm(path, content string) error {
+	input, err := json.Marshal(map[string]any{
+		"path":      path,
+		"content":   content,
+		"overwrite": true,
+		"confirm":   true,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = o.runTool("write_file", input)
+	return err
 }
 
 func coerceReadFileInput(raw json.RawMessage, task string) json.RawMessage {

@@ -24,3 +24,21 @@ func TestSaveAndLoadConfig(t *testing.T) {
 		t.Fatalf("expected 2 dirs, got %d", len(loaded.AllowedDirs))
 	}
 }
+
+func TestSaveAndLoadConfigModel(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "otter-config.json")
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	input := Config{Model: "qwen2.5-coder:14b"}
+	if err := Save(input); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	loaded, err := Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if loaded.Model != "qwen2.5-coder:14b" {
+		t.Fatalf("expected model to persist, got %q", loaded.Model)
+	}
+}

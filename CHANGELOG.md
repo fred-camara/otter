@@ -15,3 +15,8 @@
 - Added tests for permission failures, invalid paths, overwrite protection, and successful writes/moves.
 - Added undo support for the last successful move batch.
 - Improved organizer planning to preserve uniform subfolder structure when files already fit the target category.
+- Added planner abstraction package (`internal/planner`) with context-based request/response interface and Ollama wrapper.
+- Added mock planner support for tests without network/model dependencies.
+- Added Recovery Mode dry-run planning (`recover ...`) with deterministic `recovery_plan.md` and `recovery_plan.json` outputs.
+- Added optional log-assisted recovery signals (`/old/path -> /new/path`) with high-confidence reconstruction priority.
+- Added minimal interactive REPL via `otter chat` with `/exit`, `/help`, `/undo`, and `/access` commands and in-memory history.

@@ -15,6 +15,7 @@ const defaultBaseURL = "http://127.0.0.1:11434"
 type Ollama struct {
 	baseURL    string
 	model      string
+	format     string
 	httpClient *http.Client
 }
 
@@ -30,16 +31,28 @@ type generateResponse struct {
 }
 
 func NewOllama(modelName, baseURL string) *Ollama {
+	return newOllama(modelName, baseURL, "json", 90*time.Second)
+}
+
+func NewOllamaText(modelName, baseURL string) *Ollama {
+	return newOllama(modelName, baseURL, "", 240*time.Second)
+}
+
+func newOllama(modelName, baseURL, format string, timeout time.Duration) *Ollama {
 	normalizedBaseURL := strings.TrimSpace(baseURL)
 	if normalizedBaseURL == "" {
 		normalizedBaseURL = defaultBaseURL
+	}
+	if timeout <= 0 {
+		timeout = 90 * time.Second
 	}
 
 	return &Ollama{
 		baseURL: strings.TrimRight(normalizedBaseURL, "/"),
 		model:   strings.TrimSpace(modelName),
+		format:  strings.TrimSpace(format),
 		httpClient: &http.Client{
-			Timeout: 90 * time.Second,
+			Timeout: timeout,
 		},
 	}
 }
@@ -49,7 +62,7 @@ func (o *Ollama) Generate(prompt string) (string, error) {
 		Model:  o.model,
 		Prompt: prompt,
 		Stream: false,
-		Format: "json",
+		Format: o.format,
 	})
 	if err != nil {
 		return "", fmt.Errorf("marshal generate request: %w", err)

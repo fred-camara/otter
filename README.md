@@ -67,6 +67,8 @@ otter "summarize files $HOME/notes/today.md and $HOME/notes/todo.md"
 otter "write a summary report to ~/Documents/Otter/reports"
 otter "organize my downloads"
 otter "undo last move"
+otter "recover file structure in ~/Downloads/audio"
+otter chat
 otter "give otter access to Desktop and Documents"
 otter "what directories can otter access?"
 ```
@@ -77,6 +79,7 @@ otter "what directories can otter access?"
 
 - `otter "task"` sends tasks to the local model planner.
 - `otter serve` starts the local HTTP server.
+- `otter chat` starts a minimal interactive REPL.
 
 ## Directory access configuration
 
@@ -99,6 +102,7 @@ Note: Otter currently reads note files from folders (`.md`/`.txt`). Direct Apple
 - `write_file`: create-only by default, overwrite requires `overwrite=true` and `confirm=true`
 - `move_file`: no overwrite; multi-move returns dry-run first unless `confirm=true`
 - `undo last move`: reverses the most recent successful move batch
+- `recover ...`: creates a dry-run recovery plan only (`recovery_plan.md` + `recovery_plan.json`), with no file moves
 - Forbidden: delete, arbitrary shell, external API calls
 
 ## Tests
