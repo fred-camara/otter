@@ -14,7 +14,7 @@ Use Otter from the command line:
 
 ```bash
 otter "list files in ~/Downloads"
-otter "summarize this file CV_Frederic_Camara_2025.pdf"
+otter "summarize this file CV_MIKEL_ARTETA_2025.pdf"
 otter "organize my downloads"
 otter "recover file structure in ~/Downloads/audio"
 otter "undo last move"
@@ -109,7 +109,7 @@ otter "organize my downloads confirm=true"
 
 ```bash
 otter "summarize ~/notes/today.md"
-otter "summarize this file CV_Frederic_Camara_2025.pdf"
+otter "summarize this file CV_MIKEL_ARTETA_2025.pdf"
 otter "summarize files ~/notes/today.md and ~/notes/todo.md"
 ```
 
