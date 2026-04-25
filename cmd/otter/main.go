@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/chzyer/readline"
 
 	"otter/internal/agent"
 	"otter/internal/audit"
@@ -48,7 +51,7 @@ func main() {
 		return
 	}
 	if args[0] == "chat" {
-		orch, err := agent.NewOrchestratorFromEnv()
+		orch, err := agent.NewOrchestratorForMode("chat")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "orchestrator init error: %v\n", err)
 			os.Exit(1)
@@ -105,6 +108,8 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  %s chat\n", bin)
 	fmt.Fprintf(os.Stderr, "  %s model\n", bin)
 	fmt.Fprintf(os.Stderr, "  %s model set <model_name>\n", bin)
+	fmt.Fprintf(os.Stderr, "  %s model set chat <model_name>\n", bin)
+	fmt.Fprintf(os.Stderr, "  %s model show\n", bin)
 	fmt.Fprintf(os.Stderr, "  %s runs\n", bin)
 	fmt.Fprintf(os.Stderr, "  %s show run <id|latest>\n", bin)
 }
@@ -114,22 +119,59 @@ type chatTurn struct {
 	assistant string
 }
 
+type chatEditor interface {
+	Readline() (string, error)
+	Close() error
+}
+
+type scannerEditor struct {
+	scanner *bufio.Scanner
+}
+
+func (s *scannerEditor) Readline() (string, error) {
+	if !s.scanner.Scan() {
+		return "", io.EOF
+	}
+	return s.scanner.Text(), nil
+}
+
+func (s *scannerEditor) Close() error { return nil }
+
 func runChatREPL(in io.Reader, out io.Writer, run func(string) string) error {
-	scanner := bufio.NewScanner(in)
-	fmt.Fprintln(out, "Otter chat mode. Type /help for commands.")
+	printChatWelcome(out)
 	fmt.Fprintln(out, "Ollama: not checked yet")
 	if status := quickOllamaStatus(strings.TrimSpace(os.Getenv("OTTER_OLLAMA_URL")), chatOllamaCheckTimeout); status != "available" {
 		fmt.Fprintln(out, "Ollama: unavailable")
 	}
+
+	editor, err := newChatEditor(in, out)
+	if err != nil {
+		return err
+	}
+	defer editor.Close()
+	return runChatLoop(editor, out, run)
+}
+
+func runChatLoop(editor chatEditor, out io.Writer, run func(string) string) error {
 	history := make([]chatTurn, 0, 5)
 	for {
-		fmt.Fprint(out, "> ")
-		if !scanner.Scan() {
-			break
+		line, err := editor.Readline()
+		if errors.Is(err, readline.ErrInterrupt) {
+			fmt.Fprintln(out, "bye")
+			return nil
 		}
-
-		line := strings.TrimSpace(scanner.Text())
+		if errors.Is(err, io.EOF) {
+			fmt.Fprintln(out, "bye")
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		line = strings.TrimSpace(line)
 		if line == "" {
+			continue
+		}
+		if isTerminalEscapeInput(line) {
 			continue
 		}
 		if strings.HasPrefix(strings.ToLower(line), "/model") {
@@ -144,7 +186,7 @@ func runChatREPL(in io.Reader, out io.Writer, run func(string) string) error {
 			fmt.Fprintln(out, "bye")
 			return nil
 		case "/help":
-			fmt.Fprintln(out, "Commands: /exit, /help, /undo, /access, /model, /model set <name>")
+			fmt.Fprintln(out, "Commands: /help, /access, /undo, /model, /exit")
 			fmt.Fprintln(out, "Any other message runs through the same planner/executor pipeline.")
 			continue
 		case "/undo":
@@ -167,7 +209,49 @@ func runChatREPL(in io.Reader, out io.Writer, run func(string) string) error {
 		fmt.Fprintln(out, reply)
 		history = appendChatTurn(history, chatTurn{user: line, assistant: reply})
 	}
-	return scanner.Err()
+}
+
+func newChatEditor(in io.Reader, out io.Writer) (chatEditor, error) {
+	configPath, err := settings.ConfigPath()
+	if err != nil {
+		return nil, err
+	}
+	historyPath := filepath.Join(filepath.Dir(configPath), "chat_history.txt")
+	_ = os.MkdirAll(filepath.Dir(historyPath), 0o755)
+
+	if stdinFile, ok := in.(*os.File); ok {
+		if stdoutFile, outOK := out.(*os.File); outOK {
+			rl, err := readline.NewEx(&readline.Config{
+				Prompt:          "> ",
+				Stdin:           stdinFile,
+				Stdout:          stdoutFile,
+				HistoryFile:     historyPath,
+				InterruptPrompt: "^C",
+				EOFPrompt:       "exit",
+			})
+			if err == nil {
+				return rl, nil
+			}
+		}
+	}
+
+	return &scannerEditor{scanner: bufio.NewScanner(in)}, nil
+}
+
+func printChatWelcome(out io.Writer) {
+	fmt.Fprintln(out, "🦦 Otter")
+	fmt.Fprintln(out, "Hello, I’m Otter. What can I help you with?")
+	fmt.Fprintln(out, "- summarize files")
+	fmt.Fprintln(out, "- organize/recover files")
+	fmt.Fprintln(out, "- create plans")
+	fmt.Fprintln(out, "- manage directories")
+	fmt.Fprintln(out, "- inspect runs")
+	fmt.Fprintln(out, "- change model")
+	fmt.Fprintln(out, "Commands: /help /access /undo /exit")
+}
+
+func isTerminalEscapeInput(line string) bool {
+	return strings.HasPrefix(line, "\x1b[")
 }
 
 func quickOllamaStatus(rawURL string, timeout time.Duration) string {
@@ -273,14 +357,17 @@ func appendChatTurn(history []chatTurn, turn chatTurn) []chatTurn {
 }
 
 func handleModelCommand(args []string, out io.Writer) error {
-	if len(args) == 0 {
+	if len(args) == 0 || (len(args) == 1 && args[0] == "show") {
 		cfg, err := settings.Load()
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
 		name, source := agent.ResolvePlannerModelName(cfg, os.Getenv("OTTER_MODEL"))
-		fmt.Fprintf(out, "Current model: %s\n", name)
-		fmt.Fprintf(out, "Source: %s\n", source)
+		chatName, chatSource := agent.ResolveChatModelName(cfg, os.Getenv("OTTER_MODEL"))
+		fmt.Fprintf(out, "Main model: %s\n", name)
+		fmt.Fprintf(out, "Main source: %s\n", source)
+		fmt.Fprintf(out, "Chat model: %s\n", chatName)
+		fmt.Fprintf(out, "Chat source: %s\n", chatSource)
 		return nil
 	}
 	if len(args) == 1 && args[0] == "available" {
@@ -300,10 +387,13 @@ func handleModelCommand(args []string, out io.Writer) error {
 	}
 
 	if len(args) >= 2 && args[0] == "set" {
+		if len(args) >= 3 && args[1] == "chat" {
+			return setChatModel(strings.TrimSpace(strings.Join(args[2:], " ")), out)
+		}
 		return setModel(strings.TrimSpace(strings.Join(args[1:], " ")), out)
 	}
 
-	return fmt.Errorf("usage: otter model | otter model available | otter model set <model_name>")
+	return fmt.Errorf("usage: otter model show | otter model available | otter model set <model_name> | otter model set chat <model_name>")
 }
 
 func setModel(modelName string, out io.Writer) error {
@@ -321,6 +411,23 @@ func setModel(modelName string, out io.Writer) error {
 	}
 
 	fmt.Fprintf(out, "Saved model in config: %s\n", modelName)
+	fmt.Fprintf(out, "If needed, install it locally with: ollama pull %s\n", modelName)
+	return nil
+}
+
+func setChatModel(modelName string, out io.Writer) error {
+	if modelName == "" {
+		return fmt.Errorf("chat model name is required")
+	}
+	cfg, err := settings.Load()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	cfg.ChatModel = modelName
+	if err := settings.Save(cfg); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	fmt.Fprintf(out, "Saved chat model in config: %s\n", modelName)
 	fmt.Fprintf(out, "If needed, install it locally with: ollama pull %s\n", modelName)
 	return nil
 }

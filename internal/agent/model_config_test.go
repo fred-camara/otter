@@ -37,3 +37,35 @@ func TestResolvePlannerModelNameFallsBackToDefault(t *testing.T) {
 		t.Fatalf("unexpected source: %q", source)
 	}
 }
+
+func TestResolveChatModelNameUsesChatModelConfig(t *testing.T) {
+	cfg := settings.Config{Model: "planner-model", ChatModel: "chat-fast-model"}
+	name, source := ResolveChatModelName(cfg, "env-model")
+	if name != "chat-fast-model" {
+		t.Fatalf("expected chat model, got %q", name)
+	}
+	if source != "config chat_model" {
+		t.Fatalf("unexpected source: %q", source)
+	}
+}
+
+func TestResolveChatModelNameFallsBackToPlannerResolution(t *testing.T) {
+	cfg := settings.Config{Model: "planner-model"}
+	name, source := ResolveChatModelName(cfg, "env-model")
+	if name != "env-model" {
+		t.Fatalf("expected env model fallback, got %q", name)
+	}
+	if source != "environment variable OTTER_MODEL" {
+		t.Fatalf("unexpected source: %q", source)
+	}
+}
+
+func TestResolveChatModelNameFallsBackToDefault(t *testing.T) {
+	name, source := ResolveChatModelName(settings.Config{}, "")
+	if name != DefaultPlannerModelName {
+		t.Fatalf("expected default model fallback, got %q", name)
+	}
+	if source != "default" {
+		t.Fatalf("unexpected source: %q", source)
+	}
+}

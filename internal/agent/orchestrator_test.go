@@ -12,6 +12,7 @@ import (
 	"otter/internal/audit"
 	"otter/internal/planner"
 	"otter/internal/recovery"
+	"otter/internal/settings"
 )
 
 type stubPlanner struct {
@@ -64,9 +65,51 @@ func TestOrchestratorPlannerError(t *testing.T) {
 		t.Fatalf("new orchestrator: %v", err)
 	}
 
-	result := orch.Run("help me plan tomorrow")
+	result := orch.Run("execute quarterly reconciliation")
 	if !strings.Contains(result, "Planner error") {
 		t.Fatalf("expected planner error response, got: %s", result)
+	}
+}
+
+func TestConversationalInputBypassesPlanner(t *testing.T) {
+	root := t.TempDir()
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{err: fmt.Errorf("planner should not run")})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	result := orch.Run("Hello otter")
+	if strings.Contains(strings.ToLower(result), "planner") {
+		t.Fatalf("expected conversational response without planner error, got: %s", result)
+	}
+}
+
+func TestInvalidPlannerJSONConversationalFallback(t *testing.T) {
+	root := t.TempDir()
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{output: "definitely not json"})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	result := orch.Run("how are you?")
+	if strings.Contains(strings.ToLower(result), "invalid json") {
+		t.Fatalf("expected friendly conversational fallback, got: %s", result)
+	}
+	if !strings.Contains(strings.ToLower(result), "help") && !strings.Contains(strings.ToLower(result), "local file") {
+		t.Fatalf("expected conversational fallback text, got: %s", result)
+	}
+}
+
+func TestInvalidPlannerJSONToolLikePromptGetsFriendlyNonConversationalFallback(t *testing.T) {
+	root := t.TempDir()
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{output: "definitely not json"})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	result := orch.Run("summarize notes from today")
+	if strings.Contains(strings.ToLower(result), "planner returned invalid json") {
+		t.Fatalf("expected friendly fallback, got: %s", result)
+	}
+	if !strings.Contains(strings.ToLower(result), "couldn't understand") {
+		t.Fatalf("expected explicit rephrase guidance, got: %s", result)
 	}
 }
 
@@ -334,9 +377,9 @@ func TestRunLogsInvalidPlannerJSONRawAndError(t *testing.T) {
 		t.Fatalf("new orchestrator: %v", err)
 	}
 
-	result := orch.RunWithMode("plan my day", "cli")
-	if !strings.Contains(strings.ToLower(result), "invalid json") {
-		t.Fatalf("expected invalid json result, got %s", result)
+	result := orch.RunWithMode("execute quarterly reconciliation", "cli")
+	if !strings.Contains(strings.ToLower(result), "couldn't understand") {
+		t.Fatalf("expected friendly planner fallback result, got %s", result)
 	}
 	runDir, err := audit.ResolveRunDirectory("latest")
 	if err != nil {
@@ -351,7 +394,7 @@ func TestRunLogsInvalidPlannerJSONRawAndError(t *testing.T) {
 		t.Fatalf("expected parse error logged, err=%v body=%q", err, string(errs))
 	}
 	finalOutput, err := os.ReadFile(filepath.Join(runDir, "final_output.md"))
-	if err != nil || !strings.Contains(strings.ToLower(string(finalOutput)), "invalid json") {
+	if err != nil || !strings.Contains(strings.ToLower(string(finalOutput)), "couldn't understand") {
 		t.Fatalf("expected final output persisted, err=%v body=%q", err, string(finalOutput))
 	}
 	meta, err := os.ReadFile(filepath.Join(runDir, "metadata.json"))
@@ -399,6 +442,31 @@ func TestAuditFailureDoesNotBreakExecution(t *testing.T) {
 	result := orch.RunWithMode("list files in "+root, "cli")
 	if !strings.Contains(result, "Visible entries") {
 		t.Fatalf("execution should still succeed without audit writes, got %s", result)
+	}
+}
+
+func TestNewOrchestratorForModeUsesChatModelOverride(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "otter", "config.json")
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+	t.Setenv("OTTER_ALLOWED_DIRS", t.TempDir())
+	t.Setenv("OTTER_MODEL", "")
+
+	if err := settings.Save(settings.Config{
+		AllowedDirs: []string{t.TempDir()},
+		Model:       "planner-model",
+		ChatModel:   "chat-model-fast",
+	}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	orch, err := NewOrchestratorForMode("chat")
+	if err != nil {
+		t.Fatalf("new orchestrator for chat: %v", err)
+	}
+	if orch.modelName != "chat-model-fast" {
+		t.Fatalf("expected chat model override, got %q", orch.modelName)
 	}
 }
 

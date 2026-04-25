@@ -61,6 +61,10 @@ func NewOrchestrator(allowedDirs []string, planner planner.Planner) (*Orchestrat
 }
 
 func NewOrchestratorFromEnv() (*Orchestrator, error) {
+	return NewOrchestratorForMode("cli")
+}
+
+func NewOrchestratorForMode(mode string) (*Orchestrator, error) {
 	var err error
 	envDirs := parseAllowedDirs(os.Getenv("OTTER_ALLOWED_DIRS"))
 	cfg, cfgErr := settings.Load()
@@ -77,7 +81,13 @@ func NewOrchestratorFromEnv() (*Orchestrator, error) {
 		}
 	}
 
-	modelName, _ := ResolvePlannerModelName(cfg, strings.TrimSpace(os.Getenv("OTTER_MODEL")))
+	modelName := ""
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "chat":
+		modelName, _ = ResolveChatModelName(cfg, strings.TrimSpace(os.Getenv("OTTER_MODEL")))
+	default:
+		modelName, _ = ResolvePlannerModelName(cfg, strings.TrimSpace(os.Getenv("OTTER_MODEL")))
+	}
 	ollamaURL := firstNonEmpty(strings.TrimSpace(os.Getenv("OTTER_OLLAMA_URL")), defaultOllamaURL)
 	pl := planner.NewOllamaPlanner(model.NewOllama(modelName, ollamaURL))
 	orch, err := NewOrchestrator(dirs, pl)
@@ -94,7 +104,7 @@ func RunTask(task string) string {
 }
 
 func RunTaskWithMode(task, mode string) string {
-	orch, err := NewOrchestratorFromEnv()
+	orch, err := NewOrchestratorForMode(mode)
 	if err != nil {
 		return fmt.Sprintf("🦦 I couldn't initialize tools: %v", err)
 	}
@@ -123,6 +133,9 @@ func (o *Orchestrator) RunWithMode(task, mode string) (output string) {
 	}
 
 	if response, handled := o.handleUndoTask(task); handled {
+		return response
+	}
+	if response, handled := o.handleConversationalTask(task); handled {
 		return response
 	}
 
@@ -164,7 +177,10 @@ func (o *Orchestrator) RunWithMode(task, mode string) (output string) {
 		if err != nil {
 			o.logAuditError("planner_parse", err)
 			if attempt == maxPlanRetries {
-				return fmt.Sprintf("🦦 Planner returned invalid JSON after retries: %v", err)
+				if response, handled := o.conversationalFallbackForPlannerFailure(task); handled {
+					return response
+				}
+				return "🦦 I couldn't understand that request yet. Try rephrasing with a concrete action like `list files in ~/Downloads`."
 			}
 			continue
 		}
@@ -176,7 +192,10 @@ func (o *Orchestrator) RunWithMode(task, mode string) (output string) {
 		if strings.TrimSpace(parsed.Tool) == "" {
 			if attempt == maxPlanRetries {
 				o.logAuditError("planner_parse", fmt.Errorf("planner did not select a tool"))
-				return "🦦 Planner did not select a tool."
+				if response, handled := o.conversationalFallbackForPlannerFailure(task); handled {
+					return response
+				}
+				return "🦦 I couldn't understand that request yet. Try rephrasing with a concrete action like `list files in ~/Downloads`."
 			}
 			continue
 		}
@@ -184,6 +203,72 @@ func (o *Orchestrator) RunWithMode(task, mode string) (output string) {
 	}
 
 	return o.executeToolCall(task, parsed)
+}
+
+func (o *Orchestrator) conversationalFallbackForPlannerFailure(task string) (string, bool) {
+	if isLikelyConversationalInput(task) {
+		return "🦦 " + conversationalResponse(task), true
+	}
+	return "", false
+}
+
+func (o *Orchestrator) handleConversationalTask(task string) (string, bool) {
+	trimmed := strings.TrimSpace(task)
+	lower := strings.ToLower(trimmed)
+	if lower == "" {
+		return "", false
+	}
+	if !isLikelyConversationalInput(trimmed) {
+		return "", false
+	}
+	return "🦦 " + conversationalResponse(trimmed), true
+}
+
+func isLikelyConversationalInput(task string) bool {
+	lower := strings.ToLower(strings.TrimSpace(task))
+	if lower == "" {
+		return false
+	}
+	for _, phrase := range []string{
+		"hello", "hi", "hey", "good morning", "good afternoon", "good evening",
+		"how are you", "what are you", "who are you", "thanks", "thank you",
+		"nice to meet you", "what can you do", "help me",
+	} {
+		if lower == phrase || strings.HasPrefix(lower, phrase+" ") || strings.Contains(lower, phrase+"?") {
+			return true
+		}
+	}
+	if strings.HasSuffix(lower, "?") && !isLikelyToolRequest(lower) {
+		return true
+	}
+	return false
+}
+
+func isLikelyToolRequest(lowerTask string) bool {
+	toolSignals := []string{
+		"list", "files", "read", "summar", "write", "move", "organize", "recover",
+		"undo", "access", "directory", "folder", "path", "report", "run", "model",
+	}
+	for _, signal := range toolSignals {
+		if strings.Contains(lowerTask, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func conversationalResponse(task string) string {
+	lower := strings.ToLower(strings.TrimSpace(task))
+	if strings.Contains(lower, "hello") || strings.HasPrefix(lower, "hi") || strings.HasPrefix(lower, "hey") {
+		return "Hello. I can summarize files, organize or recover folders, and manage access. Try `/help` in chat or ask `list files in ~/Downloads`."
+	}
+	if strings.Contains(lower, "thank") {
+		return "You're welcome."
+	}
+	if strings.Contains(lower, "help") || strings.Contains(lower, "what can you do") {
+		return "I can summarize files, organize/recover files, create plans, manage directory access, inspect runs, and change models."
+	}
+	return "I can help with local file operations and planning. Try a concrete request like `summarize this file: ~/Downloads/file.pdf`."
 }
 
 func plannerErrorMessage(err error) string {

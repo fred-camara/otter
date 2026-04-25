@@ -42,3 +42,21 @@ func TestSaveAndLoadConfigModel(t *testing.T) {
 		t.Fatalf("expected model to persist, got %q", loaded.Model)
 	}
 }
+
+func TestSaveAndLoadConfigChatModel(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "otter-config.json")
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	input := Config{ChatModel: "llama3.1:8b"}
+	if err := Save(input); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	loaded, err := Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if loaded.ChatModel != "llama3.1:8b" {
+		t.Fatalf("expected chat model to persist, got %q", loaded.ChatModel)
+	}
+}

@@ -32,8 +32,11 @@ func TestRunChatREPLCommands(t *testing.T) {
 		t.Fatalf("unexpected dispatched tasks. got=%v want=%v", calls, expected)
 	}
 	text := out.String()
-	if !strings.Contains(text, "Commands: /exit, /help, /undo, /access, /model, /model set <name>") {
+	if !strings.Contains(text, "Commands: /help /access /undo /exit") {
 		t.Fatalf("expected help text, got %q", text)
+	}
+	if !strings.Contains(text, "Hello, I’m Otter. What can I help you with?") {
+		t.Fatalf("expected welcome greeting, got %q", text)
 	}
 	if !strings.Contains(text, "Ollama: not checked yet") {
 		t.Fatalf("expected startup ollama status, got %q", text)
@@ -135,11 +138,14 @@ func TestHandleModelCommandSetUpdatesConfig(t *testing.T) {
 	if err := handleModelCommand(nil, &readOut); err != nil {
 		t.Fatalf("handleModelCommand read: %v", err)
 	}
-	if !strings.Contains(readOut.String(), "Current model: llama3.1:8b") {
-		t.Fatalf("expected persisted model, got %q", readOut.String())
+	if !strings.Contains(readOut.String(), "Main model: llama3.1:8b") {
+		t.Fatalf("expected persisted main model, got %q", readOut.String())
 	}
-	if !strings.Contains(readOut.String(), "Source: config") {
+	if !strings.Contains(readOut.String(), "Main source: config") {
 		t.Fatalf("expected config source, got %q", readOut.String())
+	}
+	if !strings.Contains(readOut.String(), "Chat model: llama3.1:8b") {
+		t.Fatalf("expected chat fallback to main model when chat_model unset, got %q", readOut.String())
 	}
 }
 
@@ -158,10 +164,10 @@ func TestHandleModelCommandPrefersEnvSource(t *testing.T) {
 		t.Fatalf("handleModelCommand read: %v", err)
 	}
 	text := readOut.String()
-	if !strings.Contains(text, "Current model: mistral:7b") {
+	if !strings.Contains(text, "Main model: mistral:7b") {
 		t.Fatalf("expected env model, got %q", text)
 	}
-	if !strings.Contains(text, "Source: environment variable OTTER_MODEL") {
+	if !strings.Contains(text, "Main source: environment variable OTTER_MODEL") {
 		t.Fatalf("expected env source, got %q", text)
 	}
 }
@@ -195,6 +201,46 @@ func TestRunChatREPLModelSetDoesNotDispatchPlanner(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Saved model in config: qwen3.5:latest") {
 		t.Fatalf("expected set-model response, got %q", out.String())
+	}
+}
+
+func TestHandleModelCommandSetChatAndShow(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	var out bytes.Buffer
+	if err := handleModelCommand([]string{"set", "chat", "llama3.1:8b"}, &out); err != nil {
+		t.Fatalf("set chat model: %v", err)
+	}
+	if !strings.Contains(out.String(), "Saved chat model in config: llama3.1:8b") {
+		t.Fatalf("unexpected set chat output: %q", out.String())
+	}
+
+	var showOut bytes.Buffer
+	if err := handleModelCommand([]string{"show"}, &showOut); err != nil {
+		t.Fatalf("model show: %v", err)
+	}
+	if !strings.Contains(showOut.String(), "Chat model: llama3.1:8b") {
+		t.Fatalf("expected chat model in show output, got %q", showOut.String())
+	}
+}
+
+func TestRunChatLoopIgnoresEscapeSequenceInput(t *testing.T) {
+	editor := &scriptedEditor{lines: []string{"\x1b[A", "/exit"}}
+	var out bytes.Buffer
+	calls := []string{}
+	run := func(task string) string {
+		calls = append(calls, task)
+		return "ok"
+	}
+	if err := runChatLoop(editor, &out, run); err != nil {
+		t.Fatalf("runChatLoop error: %v", err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("expected no dispatched tasks for escape input, got %v", calls)
+	}
+	if strings.Contains(out.String(), "\x1b[A") {
+		t.Fatalf("should not echo escape sequence, got %q", out.String())
 	}
 }
 
@@ -253,3 +299,19 @@ type roundTripFunc func(req *http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
+
+type scriptedEditor struct {
+	lines []string
+	index int
+}
+
+func (s *scriptedEditor) Readline() (string, error) {
+	if s.index >= len(s.lines) {
+		return "", io.EOF
+	}
+	value := s.lines[s.index]
+	s.index++
+	return value, nil
+}
+
+func (s *scriptedEditor) Close() error { return nil }
