@@ -25,6 +25,9 @@ import (
 const (
 	defaultOllamaURL       = "http://127.0.0.1:11434"
 	chatOllamaCheckTimeout = 350 * time.Millisecond
+	colorTitle             = "\x1b[1;36m"
+	colorWater             = "\x1b[36m"
+	colorReset             = "\x1b[0m"
 )
 
 func main() {
@@ -138,7 +141,7 @@ func (s *scannerEditor) Readline() (string, error) {
 func (s *scannerEditor) Close() error { return nil }
 
 func runChatREPL(in io.Reader, out io.Writer, run func(string) string) error {
-	printChatWelcome(out)
+	renderChatHeader(out)
 	fmt.Fprintln(out, "Ollama: not checked yet")
 	if status := quickOllamaStatus(strings.TrimSpace(os.Getenv("OTTER_OLLAMA_URL")), chatOllamaCheckTimeout); status != "available" {
 		fmt.Fprintln(out, "Ollama: unavailable")
@@ -238,16 +241,82 @@ func newChatEditor(in io.Reader, out io.Writer) (chatEditor, error) {
 	return &scannerEditor{scanner: bufio.NewScanner(in)}, nil
 }
 
-func printChatWelcome(out io.Writer) {
-	fmt.Fprintln(out, "🦦 Otter")
+func renderChatHeader(out io.Writer) {
+	title := "🦦 Otter — local-first ops"
+	waterFinal := "  ~~~~~~~~"
+	if chatColorsEnabled(out) {
+		fmt.Fprintf(out, "%s%s%s\n", colorTitle, title, colorReset)
+	} else {
+		fmt.Fprintln(out, title)
+	}
 	fmt.Fprintln(out, "Hello, I’m Otter. What can I help you with?")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "   /\\_/\\")
+	fmt.Fprintln(out, "  ( o.o )/")
+	fmt.Fprintln(out, "   > ^ <")
+	renderWaterLine(out, waterFinal)
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Try:")
 	fmt.Fprintln(out, "- summarize files")
-	fmt.Fprintln(out, "- organize/recover files")
-	fmt.Fprintln(out, "- create plans")
-	fmt.Fprintln(out, "- manage directories")
-	fmt.Fprintln(out, "- inspect runs")
-	fmt.Fprintln(out, "- change model")
-	fmt.Fprintln(out, "Commands: /help /access /undo /exit")
+	fmt.Fprintln(out, "- organize or recover files")
+	fmt.Fprintln(out, "- create safe plans")
+	fmt.Fprintln(out, "- inspect recent runs")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Type /help for commands • /exit to quit")
+}
+
+func renderWaterLine(out io.Writer, final string) {
+	colored := wrapWaterColor(out, final)
+	if !shouldAnimateWater(out) {
+		fmt.Fprintln(out, colored)
+		return
+	}
+	frames := []string{
+		"  ~~~~~~~~",
+		"   ~~~~~~~~",
+		"  ~  ~  ~~~",
+		"   ~~ ~~ ~~",
+		"  ~~~~~~~~",
+	}
+	for _, frame := range frames {
+		fmt.Fprintf(out, "\r%s", wrapWaterColor(out, frame))
+		time.Sleep(140 * time.Millisecond)
+	}
+	fmt.Fprintf(out, "\r%s\n", colored)
+}
+
+func wrapWaterColor(out io.Writer, line string) string {
+	if !chatColorsEnabled(out) {
+		return line
+	}
+	return colorWater + line + colorReset
+}
+
+func chatColorsEnabled(out io.Writer) bool {
+	if strings.TrimSpace(os.Getenv("NO_COLOR")) != "" {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("TERM")), "dumb") {
+		return false
+	}
+	return isTTYWriter(out)
+}
+
+func shouldAnimateWater(out io.Writer) bool {
+	// Water animation is interactive-only and skipped for NO_COLOR/TERM=dumb or non-TTY output.
+	return chatColorsEnabled(out) && isTTYWriter(out)
+}
+
+func isTTYWriter(out io.Writer) bool {
+	file, ok := out.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return (info.Mode() & os.ModeCharDevice) != 0
 }
 
 func isTerminalEscapeInput(line string) bool {

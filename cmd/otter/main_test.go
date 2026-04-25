@@ -32,14 +32,50 @@ func TestRunChatREPLCommands(t *testing.T) {
 		t.Fatalf("unexpected dispatched tasks. got=%v want=%v", calls, expected)
 	}
 	text := out.String()
-	if !strings.Contains(text, "Commands: /help /access /undo /exit") {
+	if !strings.Contains(text, "Commands: /help, /access, /undo, /model, /exit") {
 		t.Fatalf("expected help text, got %q", text)
 	}
 	if !strings.Contains(text, "Hello, I’m Otter. What can I help you with?") {
 		t.Fatalf("expected welcome greeting, got %q", text)
 	}
+	if !strings.Contains(text, "🦦 Otter — local-first ops") {
+		t.Fatalf("expected branded title, got %q", text)
+	}
+	if !strings.Contains(text, "Type /help for commands • /exit to quit") {
+		t.Fatalf("expected command hint line, got %q", text)
+	}
 	if !strings.Contains(text, "Ollama: not checked yet") {
 		t.Fatalf("expected startup ollama status, got %q", text)
+	}
+}
+
+func TestRenderChatHeaderNonTTYNoAnimationOrANSI(t *testing.T) {
+	var out bytes.Buffer
+	renderChatHeader(&out)
+	text := out.String()
+	if strings.Contains(text, "\r") {
+		t.Fatalf("did not expect carriage-return animation in non-tty output: %q", text)
+	}
+	if strings.Contains(text, "\x1b[") {
+		t.Fatalf("did not expect ANSI escapes in non-tty output: %q", text)
+	}
+}
+
+func TestRenderChatHeaderNoColorWhenNO_COLORSet(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	var out bytes.Buffer
+	renderChatHeader(&out)
+	if strings.Contains(out.String(), "\x1b[") {
+		t.Fatalf("expected no ANSI escapes with NO_COLOR set, got %q", out.String())
+	}
+}
+
+func TestRenderChatHeaderNoColorWhenTermDumb(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	var out bytes.Buffer
+	renderChatHeader(&out)
+	if strings.Contains(out.String(), "\x1b[") {
+		t.Fatalf("expected no ANSI escapes with TERM=dumb, got %q", out.String())
 	}
 }
 
