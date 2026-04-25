@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"otter/internal/audit"
 	"otter/internal/planner"
 	"otter/internal/recovery"
 )
@@ -280,6 +281,124 @@ func TestSummarizeThisFileErrorsOnAmbiguousBareFilename(t *testing.T) {
 	result := orch.Run("summarize this file: duplicate.txt")
 	if !strings.Contains(strings.ToLower(result), "multiple files named") {
 		t.Fatalf("expected ambiguity message, got: %s", result)
+	}
+}
+
+func TestRunCreatesAuditDirectoryAndFinalOutput(t *testing.T) {
+	t.Setenv("OTTER_AUDIT_DISABLED", "false")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+	t.Setenv("OTTER_AUDIT_RUNS_DIR", filepath.Join(home, ".config", "otter", "runs"))
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.RunWithMode("list files in "+root, "cli")
+	if !strings.Contains(result, "Visible entries") {
+		t.Fatalf("unexpected run result: %s", result)
+	}
+
+	runDir, err := audit.ResolveRunDirectory("latest")
+	if err != nil {
+		t.Fatalf("resolve latest run: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "final_output.md")); err != nil {
+		t.Fatalf("expected final_output.md: %v", err)
+	}
+	meta, err := os.ReadFile(filepath.Join(runDir, "metadata.json"))
+	if err != nil {
+		t.Fatalf("read metadata: %v", err)
+	}
+	if !strings.Contains(string(meta), `"status": "success"`) {
+		t.Fatalf("expected success status in metadata, got %s", string(meta))
+	}
+}
+
+func TestRunLogsInvalidPlannerJSONRawAndError(t *testing.T) {
+	t.Setenv("OTTER_AUDIT_DISABLED", "false")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+	t.Setenv("OTTER_AUDIT_RUNS_DIR", filepath.Join(home, ".config", "otter", "runs"))
+
+	root := t.TempDir()
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{output: "definitely-not-json"})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.RunWithMode("plan my day", "cli")
+	if !strings.Contains(strings.ToLower(result), "invalid json") {
+		t.Fatalf("expected invalid json result, got %s", result)
+	}
+	runDir, err := audit.ResolveRunDirectory("latest")
+	if err != nil {
+		t.Fatalf("resolve latest run: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(runDir, "planner_response_raw.txt"))
+	if err != nil || !strings.Contains(string(raw), "definitely-not-json") {
+		t.Fatalf("expected raw planner response saved, err=%v body=%q", err, string(raw))
+	}
+	errs, err := os.ReadFile(filepath.Join(runDir, "errors.jsonl"))
+	if err != nil || !strings.Contains(string(errs), "planner_parse") {
+		t.Fatalf("expected parse error logged, err=%v body=%q", err, string(errs))
+	}
+	finalOutput, err := os.ReadFile(filepath.Join(runDir, "final_output.md"))
+	if err != nil || !strings.Contains(strings.ToLower(string(finalOutput)), "invalid json") {
+		t.Fatalf("expected final output persisted, err=%v body=%q", err, string(finalOutput))
+	}
+	meta, err := os.ReadFile(filepath.Join(runDir, "metadata.json"))
+	if err != nil || !strings.Contains(string(meta), `"status": "failure"`) {
+		t.Fatalf("expected failure status in metadata, err=%v body=%q", err, string(meta))
+	}
+}
+
+func TestRunLogsToolCalls(t *testing.T) {
+	t.Setenv("OTTER_AUDIT_DISABLED", "false")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+	t.Setenv("OTTER_AUDIT_RUNS_DIR", filepath.Join(home, ".config", "otter", "runs"))
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	_ = orch.RunWithMode("list files in "+root, "cli")
+	runDir, err := audit.ResolveRunDirectory("latest")
+	if err != nil {
+		t.Fatalf("resolve latest run: %v", err)
+	}
+	calls, err := os.ReadFile(filepath.Join(runDir, "tool_calls.jsonl"))
+	if err != nil || !strings.Contains(string(calls), "list_files") {
+		t.Fatalf("expected tool call log, err=%v body=%q", err, string(calls))
+	}
+}
+
+func TestAuditFailureDoesNotBreakExecution(t *testing.T) {
+	t.Setenv("OTTER_CONFIG_FILE", "/dev/null/config.json")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	result := orch.RunWithMode("list files in "+root, "cli")
+	if !strings.Contains(result, "Visible entries") {
+		t.Fatalf("execution should still succeed without audit writes, got %s", result)
 	}
 }
 

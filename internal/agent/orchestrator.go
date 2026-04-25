@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"otter/internal/audit"
 	"otter/internal/model"
 	"otter/internal/permissions"
 	"otter/internal/planner"
@@ -33,6 +34,8 @@ type Orchestrator struct {
 	planner     planner.Planner
 	modelGen    model.Interface
 	allowedDirs []string
+	modelName   string
+	audit       *audit.Logger
 }
 
 func NewOrchestrator(allowedDirs []string, planner planner.Planner) (*Orchestrator, error) {
@@ -82,18 +85,35 @@ func NewOrchestratorFromEnv() (*Orchestrator, error) {
 		return nil, err
 	}
 	orch.modelGen = model.NewOllamaText(modelName, ollamaURL)
+	orch.modelName = modelName
 	return orch, nil
 }
 
 func RunTask(task string) string {
+	return RunTaskWithMode(task, "cli")
+}
+
+func RunTaskWithMode(task, mode string) string {
 	orch, err := NewOrchestratorFromEnv()
 	if err != nil {
 		return fmt.Sprintf("🦦 I couldn't initialize tools: %v", err)
 	}
-	return orch.Run(task)
+	return orch.RunWithMode(task, mode)
 }
 
 func (o *Orchestrator) Run(task string) string {
+	return o.RunWithMode(task, "cli")
+}
+
+func (o *Orchestrator) RunWithMode(task, mode string) (output string) {
+	o.audit = audit.Start(task, mode, firstNonEmpty(o.modelName, defaultModelName))
+	defer func() {
+		if o.audit != nil {
+			o.audit.LogFinalOutput(output)
+		}
+		o.audit = nil
+	}()
+
 	if o.planner == nil {
 		return fmt.Sprintf("🦦 Stub: I received your task: %q", task)
 	}
@@ -120,8 +140,13 @@ func (o *Orchestrator) Run(task string) string {
 
 	toolNames, err := o.registry.Names()
 	if err != nil {
+		o.logAuditError("tool_registry", err)
 		return fmt.Sprintf("🦦 Could not load tools: %v", err)
 	}
+	o.logPlannerRequest(planner.Request{
+		Task:  task,
+		Tools: toolNames,
+	})
 
 	var parsed ToolCall
 	for attempt := 0; attempt <= maxPlanRetries; attempt++ {
@@ -130,11 +155,14 @@ func (o *Orchestrator) Run(task string) string {
 			Tools: toolNames,
 		})
 		if err != nil {
+			o.logAuditError("planner", err)
 			return plannerErrorMessage(err)
 		}
+		o.logPlannerResponseRaw(attempt, resp.RawJSON)
 
 		parsed, err = parseToolCall(resp.RawJSON)
 		if err != nil {
+			o.logAuditError("planner_parse", err)
 			if attempt == maxPlanRetries {
 				return fmt.Sprintf("🦦 Planner returned invalid JSON after retries: %v", err)
 			}
@@ -143,9 +171,11 @@ func (o *Orchestrator) Run(task string) string {
 		if strings.TrimSpace(parsed.Error) != "" {
 			return "🦦 " + parsed.Error
 		}
+		o.logPlannerResponseParsed(parsed)
 		parsed.Tool = normalizeToolName(parsed.Tool)
 		if strings.TrimSpace(parsed.Tool) == "" {
 			if attempt == maxPlanRetries {
+				o.logAuditError("planner_parse", fmt.Errorf("planner did not select a tool"))
 				return "🦦 Planner did not select a tool."
 			}
 			continue
@@ -469,6 +499,7 @@ func (o *Orchestrator) handleSummarizeWithModelTask(task string) (string, bool) 
 
 	output, err := o.modelGen.Generate(buildModelSummaryPrompt(task, contextByPath))
 	if err != nil {
+		o.logAuditError("model_summary", err)
 		fallback := o.executeToolCall(task, call)
 		return fmt.Sprintf("🦦 Model summary unavailable: %v\nUsing tool-based fallback.\n\n%s", err, fallback), true
 	}
@@ -598,6 +629,7 @@ func (o *Orchestrator) executeToolCall(task string, parsed ToolCall) string {
 	}
 
 	if err := permissions.ValidateToolCall(parsed.Tool, parsed.Input); err != nil {
+		o.logAuditError("permissions", err)
 		return fmt.Sprintf("🦦 Permission denied: %v\n\n%s", err, o.accessGuidance())
 	}
 
@@ -610,6 +642,7 @@ func (o *Orchestrator) executeToolCall(task string, parsed ToolCall) string {
 
 	result, err := o.runTool(parsed.Tool, parsed.Input)
 	if err != nil {
+		o.logAuditError("tool_execute", err)
 		if parsed.Tool == "list_files" {
 			fallbackInput := coerceListFilesInput(json.RawMessage("{}"), task)
 			fallbackResult, fallbackErr := o.runTool(parsed.Tool, fallbackInput)
@@ -641,16 +674,48 @@ func (o *Orchestrator) executeToolCall(task string, parsed ToolCall) string {
 
 func (o *Orchestrator) runTool(toolName string, input json.RawMessage) (string, error) {
 	if err := permissions.ValidateToolCall(toolName, input); err != nil {
+		o.logAuditError("permissions", err)
 		return "", err
 	}
 	log.Printf("otter tool start: %s", toolName)
 	result, err := o.registry.Execute(toolName, input)
+	o.logToolCall(toolName, input, result, err)
 	if err != nil {
 		log.Printf("otter tool fail: %s err=%v", toolName, err)
 		return "", err
 	}
 	log.Printf("otter tool success: %s", toolName)
 	return result, nil
+}
+
+func (o *Orchestrator) logPlannerRequest(req planner.Request) {
+	if o.audit != nil {
+		o.audit.LogPlannerRequest(req)
+	}
+}
+
+func (o *Orchestrator) logPlannerResponseRaw(attempt int, raw string) {
+	if o.audit != nil {
+		o.audit.LogPlannerResponseRaw(attempt, raw)
+	}
+}
+
+func (o *Orchestrator) logPlannerResponseParsed(parsed ToolCall) {
+	if o.audit != nil {
+		o.audit.LogPlannerResponseParsed(parsed)
+	}
+}
+
+func (o *Orchestrator) logToolCall(toolName string, input json.RawMessage, result string, err error) {
+	if o.audit != nil {
+		o.audit.LogToolCall(toolName, input, result, err)
+	}
+}
+
+func (o *Orchestrator) logAuditError(stage string, err error) {
+	if o.audit != nil {
+		o.audit.LogError(stage, err)
+	}
 }
 
 type moveHistoryInput struct {

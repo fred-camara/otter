@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"otter/internal/audit"
 )
 
 func TestRunChatREPLCommands(t *testing.T) {
@@ -193,6 +195,56 @@ func TestRunChatREPLModelSetDoesNotDispatchPlanner(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Saved model in config: qwen3.5:latest") {
 		t.Fatalf("expected set-model response, got %q", out.String())
+	}
+}
+
+func TestHandleRunsCommandListsRuns(t *testing.T) {
+	t.Setenv("OTTER_AUDIT_DISABLED", "false")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+	t.Setenv("OTTER_AUDIT_RUNS_DIR", filepath.Join(home, ".config", "otter", "runs"))
+
+	first := audit.Start("list files", "cli", "qwen")
+	first.LogFinalOutput("ok")
+
+	var out bytes.Buffer
+	if err := handleRunsCommand(&out); err != nil {
+		t.Fatalf("handleRunsCommand error: %v", err)
+	}
+	text := out.String()
+	if !strings.Contains(text, first.RunID()) {
+		t.Fatalf("expected run id in runs list, got %q", text)
+	}
+	if !strings.Contains(strings.ToLower(text), "success") {
+		t.Fatalf("expected status in runs list, got %q", text)
+	}
+}
+
+func TestHandleShowRunLatestWorks(t *testing.T) {
+	t.Setenv("OTTER_AUDIT_DISABLED", "false")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+	t.Setenv("OTTER_AUDIT_RUNS_DIR", filepath.Join(home, ".config", "otter", "runs"))
+
+	run := audit.Start("organize downloads", "chat", "qwen")
+	run.LogError("planner_parse", errors.New("no JSON object found"))
+	run.LogFinalOutput("failed")
+
+	var out bytes.Buffer
+	if err := handleShowRunCommand("latest", &out); err != nil {
+		t.Fatalf("handleShowRunCommand error: %v", err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "Input: organize downloads") {
+		t.Fatalf("expected input line, got %q", text)
+	}
+	if !strings.Contains(text, "Status: failure") {
+		t.Fatalf("expected failure status, got %q", text)
+	}
+	if !strings.Contains(strings.ToLower(text), "planner_parse") {
+		t.Fatalf("expected key error in output, got %q", text)
 	}
 }
 

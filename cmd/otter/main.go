@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"otter/internal/agent"
+	"otter/internal/audit"
 	"otter/internal/config"
 	"otter/internal/settings"
 	"otter/internal/transport"
@@ -37,7 +38,9 @@ func main() {
 			os.Exit(1)
 		}
 
-		srv := transport.NewServer(cfg, agent.RunTask)
+		srv := transport.NewServer(cfg, func(task string) string {
+			return agent.RunTaskWithMode(task, "http")
+		})
 		if err := srv.ListenAndServe(); err != nil {
 			fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 			os.Exit(1)
@@ -50,8 +53,26 @@ func main() {
 			fmt.Fprintf(os.Stderr, "orchestrator init error: %v\n", err)
 			os.Exit(1)
 		}
-		if err := runChatREPL(os.Stdin, os.Stdout, orch.Run); err != nil {
+		if err := runChatREPL(os.Stdin, os.Stdout, func(task string) string { return orch.RunWithMode(task, "chat") }); err != nil {
 			fmt.Fprintf(os.Stderr, "chat error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if args[0] == "runs" {
+		if err := handleRunsCommand(os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "runs error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if args[0] == "show" && len(args) >= 2 && args[1] == "run" {
+		selector := "latest"
+		if len(args) >= 3 {
+			selector = args[2]
+		}
+		if err := handleShowRunCommand(selector, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "show run error: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -70,7 +91,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Println(agent.RunTask(task))
+	fmt.Println(agent.RunTaskWithMode(task, "cli"))
 }
 
 func printUsage() {
@@ -84,6 +105,8 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  %s chat\n", bin)
 	fmt.Fprintf(os.Stderr, "  %s model\n", bin)
 	fmt.Fprintf(os.Stderr, "  %s model set <model_name>\n", bin)
+	fmt.Fprintf(os.Stderr, "  %s runs\n", bin)
+	fmt.Fprintf(os.Stderr, "  %s show run <id|latest>\n", bin)
 }
 
 type chatTurn struct {
@@ -336,4 +359,75 @@ func handleChatModelCommand(line string) string {
 		return "Model command error: " + err.Error()
 	}
 	return strings.TrimSpace(output.String())
+}
+
+func handleRunsCommand(out io.Writer) error {
+	items, err := audit.ListRunSummaries(20)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		fmt.Fprintln(out, "No runs found.")
+		return nil
+	}
+	for _, item := range items {
+		fmt.Fprintf(out, "%s  %s  %s\n", item.ID, item.Status, item.Input)
+	}
+	return nil
+}
+
+func handleShowRunCommand(selector string, out io.Writer) error {
+	runDir, err := audit.ResolveRunDirectory(selector)
+	if err != nil {
+		return err
+	}
+
+	inputBytes, _ := os.ReadFile(filepath.Join(runDir, "input.txt"))
+	metaBytes, _ := os.ReadFile(filepath.Join(runDir, "metadata.json"))
+	errorBytes, _ := os.ReadFile(filepath.Join(runDir, "errors.jsonl"))
+	finalBytes, _ := os.ReadFile(filepath.Join(runDir, "final_output.md"))
+
+	var meta map[string]any
+	_ = json.Unmarshal(metaBytes, &meta)
+
+	fmt.Fprintf(out, "Run: %s\n", runDir)
+	fmt.Fprintf(out, "Input: %s\n", strings.TrimSpace(string(inputBytes)))
+	if status, ok := meta["status"].(string); ok && strings.TrimSpace(status) != "" {
+		fmt.Fprintf(out, "Status: %s\n", status)
+	}
+	if mode, ok := meta["mode"].(string); ok && strings.TrimSpace(mode) != "" {
+		fmt.Fprintf(out, "Mode: %s\n", mode)
+	}
+	if modelName, ok := meta["model"].(string); ok && strings.TrimSpace(modelName) != "" {
+		fmt.Fprintf(out, "Model: %s\n", modelName)
+	}
+
+	errorLines := strings.Split(strings.TrimSpace(string(errorBytes)), "\n")
+	if len(strings.TrimSpace(string(errorBytes))) > 0 {
+		fmt.Fprintln(out, "Errors:")
+		count := 0
+		for _, line := range errorLines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			fmt.Fprintf(out, "- %s\n", line)
+			count++
+			if count >= 5 {
+				break
+			}
+		}
+	} else {
+		fmt.Fprintln(out, "Errors: none")
+	}
+
+	finalSnippet := strings.TrimSpace(string(finalBytes))
+	if len(finalSnippet) > 500 {
+		finalSnippet = finalSnippet[:500] + "...[truncated]"
+	}
+	if finalSnippet != "" {
+		fmt.Fprintf(out, "Final output snippet:\n%s\n", finalSnippet)
+	}
+	fmt.Fprintf(out, "Files: %s\n", runDir)
+	return nil
 }
