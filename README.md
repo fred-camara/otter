@@ -1,5 +1,9 @@
 # Otter
 
+<p align="center">
+  <img src="logo.png" alt="Otter logo" width="180">
+</p>
+
 Local-first macOS CLI for small personal ops tasks: files, summaries, recovery plans, and local model-assisted workflows.
 
 Otter runs on your machine, uses Ollama for planning and summaries, and keeps safety checks in the executor. It can help with common file tasks, but it is intentionally conservative about writes and moves.
@@ -374,3 +378,7 @@ Equivalent Go command:
 ```bash
 go test ./...
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
