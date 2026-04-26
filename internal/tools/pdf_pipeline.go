@@ -698,22 +698,17 @@ func renderPageForChunk(page ExtractedPage) string {
 	if text == "" {
 		return ""
 	}
+	text = stripLowValuePageLines(text)
 	var builder strings.Builder
-	builder.WriteString(fmt.Sprintf("Page %d [%s]\n", page.PageNumber, page.Kind))
-	if page.Method != "" {
-		builder.WriteString("Method: ")
-		builder.WriteString(page.Method)
-		builder.WriteString("\n")
-	}
 	if page.FallbackReason != "" {
-		builder.WriteString("Fallback: ")
+		builder.WriteString("Extraction note: ")
 		builder.WriteString(page.FallbackReason)
 		builder.WriteString("\n")
 	}
 	builder.WriteString(text)
-	if len(page.Tables) > 0 && page.Tables[0].Markdown != "" && !strings.Contains(text, page.Tables[0].Markdown) {
+	if markdown := chooseTableMarkdownForChunk(text, page.Tables); markdown != "" {
 		builder.WriteString("\n\nTable:\n")
-		builder.WriteString(page.Tables[0].Markdown)
+		builder.WriteString(markdown)
 	}
 	if len(page.Warnings) > 0 {
 		builder.WriteString("\n\nWarnings:\n")
@@ -726,6 +721,82 @@ func renderPageForChunk(page ExtractedPage) string {
 		}
 	}
 	return strings.TrimSpace(builder.String())
+}
+
+func stripLowValuePageLines(text string) string {
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			filtered = append(filtered, "")
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "page ") && strings.Contains(lower, " of ") {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.TrimSpace(strings.Join(filtered, "\n"))
+}
+
+func chooseTableMarkdownForChunk(text string, tables []ExtractedTable) string {
+	if len(tables) == 0 {
+		return ""
+	}
+	markdown := strings.TrimSpace(tables[0].Markdown)
+	if markdown == "" {
+		return ""
+	}
+	if tableMostlyDuplicatesText(text, markdown) {
+		return ""
+	}
+	return markdown
+}
+
+func tableMostlyDuplicatesText(text, markdown string) bool {
+	textTokens := tokenSetForOverlap(text)
+	tableTokens := tokenSetForOverlap(markdown)
+	if len(textTokens) == 0 || len(tableTokens) == 0 {
+		return false
+	}
+	shared := 0
+	for token := range tableTokens {
+		if _, ok := textTokens[token]; ok {
+			shared++
+		}
+	}
+	return shared*100/len(tableTokens) >= 70
+}
+
+func tokenSetForOverlap(text string) map[string]struct{} {
+	replacer := strings.NewReplacer(
+		"|", " ",
+		"\n", " ",
+		"\t", " ",
+		",", " ",
+		".", " ",
+		":", " ",
+		";", " ",
+		"(", " ",
+		")", " ",
+		"[", " ",
+		"]", " ",
+	)
+	normalized := strings.ToLower(replacer.Replace(text))
+	fields := strings.Fields(normalized)
+	tokens := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		if len(field) < 3 {
+			continue
+		}
+		tokens[field] = struct{}{}
+	}
+	return tokens
 }
 
 func normalizeExtractedPDFText(text string) string {

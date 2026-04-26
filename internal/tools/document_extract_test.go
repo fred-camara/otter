@@ -91,6 +91,81 @@ func TestBuildDocumentChunksSkipsEmptyFailedPagesAndPreservesOrder(t *testing.T)
 	}
 }
 
+func TestRenderPageForChunkStripsLowValueBoilerplate(t *testing.T) {
+	page := ExtractedPage{
+		PageNumber: 1,
+		Kind:       PageKindTableLike,
+		Method:     "pdfkit",
+		Text: "Ronnie Kritou\nStaff Software Engineer @ Datadog\nPage 1 of 2\n" +
+			"Experience\nDatadog",
+	}
+
+	rendered := renderPageForChunk(page)
+	if strings.Contains(rendered, "Page 1 [table_like]") {
+		t.Fatalf("expected page header to be omitted, got %q", rendered)
+	}
+	if strings.Contains(rendered, "Method: pdfkit") {
+		t.Fatalf("expected method line to be omitted, got %q", rendered)
+	}
+	if strings.Contains(rendered, "Page 1 of 2") {
+		t.Fatalf("expected footer line to be omitted, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "Ronnie Kritou") || !strings.Contains(rendered, "Datadog") {
+		t.Fatalf("expected meaningful content to remain, got %q", rendered)
+	}
+}
+
+func TestRenderPageForChunkSkipsDuplicateTableMarkdown(t *testing.T) {
+	page := ExtractedPage{
+		PageNumber: 1,
+		Kind:       PageKindTableLike,
+		Text: strings.Join([]string{
+			"Contact",
+			"Ronnie Kritou",
+			"Datadog",
+			"Staff Software Engineer",
+		}, "\n"),
+		Tables: []ExtractedTable{
+			{
+				Markdown: strings.Join([]string{
+					"| Contact |  |",
+					"| --- | --- |",
+					"| Ronnie Kritou |  |",
+					"| Datadog |  |",
+					"| Staff Software Engineer |  |",
+				}, "\n"),
+			},
+		},
+	}
+
+	rendered := renderPageForChunk(page)
+	if strings.Contains(rendered, "Table:\n") {
+		t.Fatalf("expected duplicate table markdown to be omitted, got %q", rendered)
+	}
+}
+
+func TestRenderPageForChunkKeepsNonDuplicateTableMarkdown(t *testing.T) {
+	page := ExtractedPage{
+		PageNumber: 1,
+		Kind:       PageKindTableLike,
+		Text:       "Quarterly results summary",
+		Tables: []ExtractedTable{
+			{
+				Markdown: strings.Join([]string{
+					"| Quarter | Revenue |",
+					"| --- | --- |",
+					"| Q1 2024 | 1200000 |",
+				}, "\n"),
+			},
+		},
+	}
+
+	rendered := renderPageForChunk(page)
+	if !strings.Contains(rendered, "Table:\n| Quarter | Revenue |") {
+		t.Fatalf("expected non-duplicate table markdown to remain, got %q", rendered)
+	}
+}
+
 func TestExtractDocumentWithOptionsUsesBoundedDefaults(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "notes.txt")

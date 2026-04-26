@@ -108,6 +108,18 @@ func (o *Orchestrator) summarizeDocumentsWithModel(task string, docs []*tools.Ex
 		}
 		return "", fmt.Errorf("all chunk summaries failed")
 	}
+	if successes == 1 {
+		for _, result := range results {
+			if result.err != nil || strings.TrimSpace(result.output) == "" {
+				continue
+			}
+			final := strings.TrimSpace(result.output)
+			if len(warnings) > 0 {
+				final += "\n\nWarnings:\n- " + strings.Join(warnings, "\n- ")
+			}
+			return final, nil
+		}
+	}
 
 	o.emitProgress(fmt.Sprintf("Merging %d chunk summary result(s)", successes))
 	mergePrompt := buildChunkMergePrompt(task, docs, results)
@@ -154,7 +166,10 @@ func buildChunkSummaryPrompt(path string, chunk tools.DocumentChunk, doc *tools.
 	builder := strings.Builder{}
 	builder.WriteString("You are Otter. Analyze this extracted document chunk for a local-first assistant using Qwen.\n")
 	builder.WriteString("Return concise markdown with these sections exactly:\n")
-	builder.WriteString("1. Summary\n2. Key Facts\n3. Entities\n4. Dates\n5. Financials\n6. Obligations\n7. Table Summaries\n8. Uncertainties\n9. Page Refs\n\n")
+	builder.WriteString("1. Summary\n2. Key Facts\n3. Open Questions\n\n")
+	if chunk.Kind == "table_like" {
+		builder.WriteString("If the chunk contains table-like content, include a short 'Tables' subsection under Key Facts.\n\n")
+	}
 	builder.WriteString("Source: ")
 	builder.WriteString(path)
 	builder.WriteString("\nPages: ")
@@ -163,7 +178,8 @@ func buildChunkSummaryPrompt(path string, chunk tools.DocumentChunk, doc *tools.
 	builder.WriteString(chunk.Kind)
 	builder.WriteString("\nWarnings: ")
 	builder.WriteString(strings.Join(warnings, "; "))
-	builder.WriteString("\n\nContent:\n")
+	builder.WriteString("\n\nFocus on the most useful facts and avoid repeating the chunk verbatim.\n")
+	builder.WriteString("Content:\n")
 	builder.WriteString(chunk.Text)
 	return builder.String()
 }
@@ -171,15 +187,9 @@ func buildChunkSummaryPrompt(path string, chunk tools.DocumentChunk, doc *tools.
 func buildChunkMergePrompt(task string, docs []*tools.ExtractedDocument, results []chunkSummaryResult) string {
 	builder := strings.Builder{}
 	builder.WriteString("You are Otter. Merge chunk-level document analyses into one user-facing summary.\n")
-	builder.WriteString("Return concise markdown with:\n")
-	builder.WriteString("- one short overview paragraph\n")
-	builder.WriteString("- key facts\n")
-	builder.WriteString("- entities\n")
-	builder.WriteString("- dates\n")
-	builder.WriteString("- financials if present\n")
-	builder.WriteString("- obligations or action items\n")
-	builder.WriteString("- uncertainties and extraction warnings\n")
-	builder.WriteString("- page references when useful\n\n")
+	builder.WriteString("Return concise markdown with these sections exactly:\n")
+	builder.WriteString("1. Summary\n2. Key Facts\n3. Open Questions\n\n")
+	builder.WriteString("Keep it brief, deduplicate overlapping facts, and mention warnings only if they affect confidence.\n\n")
 	builder.WriteString("User request: ")
 	builder.WriteString(task)
 	builder.WriteString("\n\nDocuments:\n")

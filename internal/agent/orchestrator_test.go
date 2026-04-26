@@ -696,8 +696,8 @@ func TestSummarizeDocumentsWithModelRecordsChunkWarnings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("summarize documents: %v", err)
 	}
-	if !strings.Contains(result, "Merged with warnings") {
-		t.Fatalf("expected merged summary, got: %s", result)
+	if !strings.Contains(result, "Chunk summary") {
+		t.Fatalf("expected successful chunk summary, got: %s", result)
 	}
 	if !strings.Contains(result, "pages 2-2") {
 		t.Fatalf("expected chunk failure warning, got: %s", result)
@@ -738,6 +738,39 @@ func TestSummarizeDocumentsWithModelEmitsProgressStages(t *testing.T) {
 	}
 	if !strings.Contains(joined, "Merging 2 chunk summary result(s)") {
 		t.Fatalf("expected merge progress, got: %s", joined)
+	}
+}
+
+func TestSummarizeDocumentsWithModelSkipsMergeForSingleSuccessfulChunk(t *testing.T) {
+	orch := &Orchestrator{
+		modelGen:            stubModelGenerator{output: "## Summary\n\nSingle chunk result"},
+		modelSummaryTimeout: 2 * time.Second,
+		modelSummaryWorkers: 1,
+	}
+	progress := make([]string, 0, 2)
+	orch.SetProgressReporter(func(message string) {
+		progress = append(progress, message)
+	})
+
+	docs := []*tools.ExtractedDocument{
+		{
+			SourcePath: "/tmp/profile.pdf",
+			Chunks: []tools.DocumentChunk{
+				{ID: "chunk-1", PageStart: 1, PageEnd: 2, Text: "alpha beta", Kind: "text_native"},
+			},
+		},
+	}
+
+	result, err := orch.summarizeDocumentsWithModel("summarize this", docs)
+	if err != nil {
+		t.Fatalf("summarize documents: %v", err)
+	}
+	if !strings.Contains(result, "Single chunk result") {
+		t.Fatalf("expected direct chunk summary, got: %s", result)
+	}
+	joined := strings.Join(progress, "\n")
+	if strings.Contains(joined, "Merging 1 chunk summary result(s)") {
+		t.Fatalf("did not expect merge progress for single successful chunk, got: %s", joined)
 	}
 }
 
