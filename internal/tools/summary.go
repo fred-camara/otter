@@ -4,12 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"strings"
-
-	pdf "github.com/dslipak/pdf"
 )
 
 type SummarizeFilesTool struct {
@@ -78,139 +74,6 @@ func (t *SummarizeFilesTool) Execute(input json.RawMessage) (string, error) {
 	return "Summary:\n- " + strings.Join(lines, "\n- "), nil
 }
 
-func ExtractSummarizableText(path string, allowedDirs []string) (string, error) {
-	absPath, err := ResolvePath(path)
-	if err != nil {
-		return "", fmt.Errorf("resolve path %q: %w", path, err)
-	}
-	if !isPathAllowed(absPath, allowedDirs) {
-		return "", fmt.Errorf("path is outside allowed directories: %s", absPath)
-	}
-	if isHiddenPath(absPath) {
-		return "", fmt.Errorf("hidden paths are not allowed: %s", absPath)
-	}
-
-	content, err := os.ReadFile(absPath)
-	if err != nil {
-		return "", fmt.Errorf("read file %s: %w", absPath, err)
-	}
-
-	var text string
-	if strings.EqualFold(filepath.Ext(absPath), ".pdf") {
-		text, err = extractPDFText(absPath)
-		if err != nil {
-			return "", fmt.Errorf("read pdf %s: %w", absPath, err)
-		}
-		if strings.TrimSpace(text) == "" {
-			return "", fmt.Errorf("pdf has no extractable text: %s", absPath)
-		}
-	} else {
-		if !isTextLike(content) {
-			return "", fmt.Errorf("binary files are not supported: %s", absPath)
-		}
-		text = string(content)
-	}
-
-	text = sanitizeExtractedText(text)
-	if strings.TrimSpace(text) == "" {
-		return "", fmt.Errorf("file has no usable text content: %s", absPath)
-	}
-	if len(text) > 64000 {
-		text = text[:64000]
-	}
-	return strings.TrimSpace(text), nil
-}
-
-func extractPDFText(path string) (string, error) {
-	reader, err := pdf.Open(path)
-	if err != nil {
-		return "", err
-	}
-
-	rowText, err := extractPDFTextByRows(reader)
-	if err != nil {
-		return "", err
-	}
-
-	plainTextReader, err := reader.GetPlainText()
-	if err != nil {
-		return "", err
-	}
-	raw, err := io.ReadAll(io.LimitReader(plainTextReader, 4<<20))
-	if err != nil {
-		return "", err
-	}
-
-	plainText := strings.TrimSpace(string(raw))
-	if len(plainText) > 64000 {
-		plainText = plainText[:64000]
-	}
-
-	if preferStructuredPDFText(rowText, plainText) {
-		return rowText, nil
-	}
-	return plainText, nil
-}
-
-func extractPDFTextByRows(reader *pdf.Reader) (string, error) {
-	pages := reader.NumPage()
-	if pages == 0 {
-		return "", nil
-	}
-
-	lines := make([]string, 0, 64)
-	for i := 1; i <= pages; i++ {
-		page := reader.Page(i)
-		rows, err := page.GetTextByRow()
-		if err != nil {
-			return "", err
-		}
-		for _, row := range rows {
-			parts := make([]string, 0, len(row.Content))
-			for _, item := range row.Content {
-				part := strings.TrimSpace(item.S)
-				if part != "" {
-					parts = append(parts, part)
-				}
-			}
-			if len(parts) == 0 {
-				continue
-			}
-			line := strings.Join(parts, " ")
-			line = strings.Join(strings.Fields(line), " ")
-			if line != "" {
-				lines = append(lines, line)
-			}
-		}
-	}
-
-	text := strings.TrimSpace(strings.Join(lines, "\n"))
-	if len(text) > 64000 {
-		text = text[:64000]
-	}
-	return text, nil
-}
-
-func preferStructuredPDFText(rowText, plainText string) bool {
-	rowText = strings.TrimSpace(rowText)
-	plainText = strings.TrimSpace(plainText)
-	if rowText == "" {
-		return false
-	}
-	if plainText == "" {
-		return true
-	}
-	rowLines := 1 + strings.Count(rowText, "\n")
-	plainLines := 1 + strings.Count(plainText, "\n")
-	if rowLines > 1 && rowLines >= plainLines/2 {
-		return true
-	}
-	if len(rowText) >= int(float64(len(plainText))*0.75) {
-		return true
-	}
-	return false
-}
-
 func sanitizeExtractedText(text string) string {
 	text = strings.ReplaceAll(text, "\x00", "")
 	builder := strings.Builder{}
@@ -233,14 +96,29 @@ func summarizeText(name, text string) string {
 	}
 	lineCount := 1 + strings.Count(text, "\n")
 	wordCount := len(strings.Fields(text))
-	firstLine := text
-	if idx := strings.IndexRune(text, '\n'); idx >= 0 {
-		firstLine = text[:idx]
+	lines := strings.Split(text, "\n")
+	previewLines := make([]string, 0, 3)
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.Trim(line, "|- :") == "" {
+			continue
+		}
+		previewLines = append(previewLines, line)
+		if len(previewLines) == 3 {
+			break
+		}
 	}
-	if len(firstLine) > 120 {
-		firstLine = firstLine[:120] + "..."
+	preview := text
+	if len(previewLines) > 0 {
+		preview = strings.Join(previewLines, " | ")
 	}
-	return fmt.Sprintf("%s: %d lines, %d words, starts with %q", name, lineCount, wordCount, firstLine)
+	if len(preview) > 120 {
+		preview = preview[:120] + "..."
+	}
+	return fmt.Sprintf("%s: %d lines, %d words, starts with %q", name, lineCount, wordCount, preview)
 }
 
 func extractPathsAlias(raw json.RawMessage, aliases ...string) ([]string, error) {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -31,7 +32,9 @@ const (
 	defaultModelName           = "qwen2.5-coder:14b"
 	defaultOllamaURL           = "http://127.0.0.1:11434"
 	maxPlanRetries             = 2
-	defaultModelSummaryTimeout = 120 * time.Second
+	defaultModelSummaryTimeout = 5 * time.Minute
+	defaultChatSummaryTimeout  = 120 * time.Second
+	chatOllamaProbeTimeout     = 1200 * time.Millisecond
 )
 
 type Orchestrator struct {
@@ -42,6 +45,8 @@ type Orchestrator struct {
 	modelName           string
 	audit               *audit.Logger
 	modelSummaryTimeout time.Duration
+	modelSummaryWorkers int
+	progressReporter    func(string)
 	pendingCleanup      *pendingCleanupContext
 }
 
@@ -74,6 +79,7 @@ func NewOrchestrator(allowedDirs []string, planner planner.Planner) (*Orchestrat
 		planner:             planner,
 		allowedDirs:         normalizedDirs,
 		modelSummaryTimeout: defaultModelSummaryTimeout,
+		modelSummaryWorkers: defaultChunkSummaryConcurrency,
 	}, nil
 }
 
@@ -113,7 +119,42 @@ func NewOrchestratorForMode(mode string) (*Orchestrator, error) {
 	}
 	orch.modelGen = model.NewOllamaText(modelName, ollamaURL)
 	orch.modelName = modelName
+	timeoutDefault := defaultModelSummaryTimeout
+	if strings.TrimSpace(strings.ToLower(mode)) == "chat" {
+		timeoutDefault = defaultChatSummaryTimeout
+	}
+	orch.modelSummaryTimeout = modelSummaryTimeoutFromEnv(timeoutDefault)
+	orch.modelSummaryWorkers = modelSummaryWorkersFromEnv(defaultChunkSummaryConcurrency)
 	return orch, nil
+}
+
+func modelSummaryTimeoutFromEnv(defaultValue time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv("OTTER_MODEL_SUMMARY_TIMEOUT"))
+	if raw == "" {
+		return defaultValue
+	}
+	if duration, err := time.ParseDuration(raw); err == nil && duration > 0 {
+		return duration
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultValue
+}
+
+func modelSummaryWorkersFromEnv(defaultValue int) int {
+	raw := strings.TrimSpace(os.Getenv("OTTER_MODEL_SUMMARY_WORKERS"))
+	if raw == "" {
+		return defaultValue
+	}
+	workers, err := strconv.Atoi(raw)
+	if err != nil || workers <= 0 {
+		return defaultValue
+	}
+	if workers > 4 {
+		return 4
+	}
+	return workers
 }
 
 func RunTask(task string) string {
@@ -126,6 +167,10 @@ func RunTaskWithMode(task, mode string) string {
 		return fmt.Sprintf("🦦 I couldn't initialize tools: %v", err)
 	}
 	return orch.RunWithMode(task, mode)
+}
+
+func (o *Orchestrator) SetProgressReporter(report func(string)) {
+	o.progressReporter = report
 }
 
 func (o *Orchestrator) Run(task string) string {
@@ -156,7 +201,7 @@ func (o *Orchestrator) RunWithMode(task, mode string) (output string) {
 		return response
 	}
 
-	if response, handled := o.handleSummarizeWithModelTask(task); handled {
+	if response, handled := o.handleSummarizeWithModelTask(task, mode); handled {
 		return response
 	}
 
@@ -226,6 +271,17 @@ func (o *Orchestrator) RunWithMode(task, mode string) (output string) {
 	}
 
 	return o.executeToolCall(task, parsed)
+}
+
+func (o *Orchestrator) emitProgress(message string) {
+	if o == nil || o.progressReporter == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(message)
+	if trimmed == "" {
+		return
+	}
+	o.progressReporter(trimmed)
 }
 
 func (o *Orchestrator) RunOrganizeAudioCLI(root, contextRoot string, execute, deeperAnalysis bool, in io.Reader, out io.Writer) (string, error) {
@@ -336,7 +392,7 @@ func (o *Orchestrator) RunStageEmptyFoldersCLI(root, stageRoot string, confirm b
 		return "", err
 	}
 	if !pathWithinAllowed(resolvedRoot, o.allowedDirs) {
-		return "", fmt.Errorf(o.cleanupAccessDeniedMessage(resolvedRoot))
+		return "", errors.New(o.cleanupAccessDeniedMessage(resolvedRoot))
 	}
 	service := cleanup.NewService(o.audit)
 	if !confirm {
@@ -1050,7 +1106,7 @@ func stripLeadingSummarizeFileTargetPrefix(value string) string {
 	return trimmed
 }
 
-func (o *Orchestrator) handleSummarizeWithModelTask(task string) (string, bool) {
+func (o *Orchestrator) handleSummarizeWithModelTask(task, mode string) (string, bool) {
 	call, ok := o.summarizeToolCallFromTask(task)
 	if !ok {
 		return "", false
@@ -1071,20 +1127,27 @@ func (o *Orchestrator) handleSummarizeWithModelTask(task string) (string, bool) 
 	if o.modelGen == nil {
 		return o.executeToolCall(task, call), true
 	}
+	if strings.TrimSpace(strings.ToLower(mode)) == "chat" && !quickOllamaReachable(strings.TrimSpace(os.Getenv("OTTER_OLLAMA_URL")), chatOllamaProbeTimeout) {
+		fallback := o.executeToolCall(task, call)
+		return "🦦 Model summary unavailable: Ollama is slow or unreachable right now.\nUsing tool-based fallback.\n\n" + fallback, true
+	}
 
-	contextByPath := make(map[string]string, len(payload.Paths))
-	for _, path := range payload.Paths {
-		text, err := tools.ExtractSummarizableText(path, o.allowedDirs)
+	docs := make([]*tools.ExtractedDocument, 0, len(payload.Paths))
+	for index, path := range payload.Paths {
+		o.emitProgress(fmt.Sprintf("Extracting document %d/%d: %s", index+1, len(payload.Paths), filepath.Base(path)))
+		doc, err := tools.ExtractDocument(path, o.allowedDirs)
 		if err != nil {
 			return fmt.Sprintf("🦦 Tool error: %v", err), true
 		}
-		if len(text) > 12000 {
-			text = text[:12000] + "\n...[truncated]"
-		}
-		contextByPath[path] = buildModelSummaryContext(path, text)
+		docs = append(docs, doc)
 	}
+	totalChunks := 0
+	for _, doc := range docs {
+		totalChunks += len(doc.Chunks)
+	}
+	o.emitProgress(fmt.Sprintf("Prepared %d chunk(s) from %d document(s)", totalChunks, len(docs)))
 
-	output, err := o.generateModelSummaryWithTimeout(buildModelSummaryPrompt(task, contextByPath))
+	output, err := o.summarizeDocumentsWithModel(task, docs)
 	if err != nil {
 		o.logAuditError("model_summary", err)
 		fallback := o.executeToolCall(task, call)
@@ -1096,6 +1159,24 @@ func (o *Orchestrator) handleSummarizeWithModelTask(task string) (string, bool) 
 		return "🦦 Model summary unavailable: model returned empty output.\nUsing tool-based fallback.\n\n" + fallback, true
 	}
 	return "🦦 " + output, true
+}
+
+func quickOllamaReachable(rawURL string, timeout time.Duration) bool {
+	baseURL := strings.TrimSpace(rawURL)
+	if baseURL == "" {
+		baseURL = defaultOllamaURL
+	}
+	client := &http.Client{Timeout: timeout}
+	request, err := http.NewRequest(http.MethodGet, strings.TrimRight(baseURL, "/")+"/api/tags", nil)
+	if err != nil {
+		return false
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return false
+	}
+	defer response.Body.Close()
+	return response.StatusCode == http.StatusOK
 }
 
 func (o *Orchestrator) generateModelSummaryWithTimeout(prompt string) (string, error) {

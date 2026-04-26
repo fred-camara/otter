@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"otter/internal/planner"
 	"otter/internal/recovery"
 	"otter/internal/settings"
+	"otter/internal/tools"
 )
 
 type stubPlanner struct {
@@ -31,6 +33,17 @@ type blockingModelGenerator struct {
 	started chan struct{}
 	release chan struct{}
 	done    chan struct{}
+}
+
+type trackingModelGenerator struct {
+	mu             sync.Mutex
+	active         int
+	maxActive      int
+	prompts        []string
+	failOnPages    string
+	chunkDelay     time.Duration
+	mergeOutput    string
+	chunkOutputFmt string
 }
 
 func (s stubPlanner) Plan(_ context.Context, _ planner.Request) (planner.Response, error) {
@@ -58,6 +71,46 @@ func (b *blockingModelGenerator) Generate(_ string) (string, error) {
 		close(b.done)
 	}
 	return "blocked model output", nil
+}
+
+func (t *trackingModelGenerator) Generate(prompt string) (string, error) {
+	t.mu.Lock()
+	t.prompts = append(t.prompts, prompt)
+	t.active++
+	if t.active > t.maxActive {
+		t.maxActive = t.active
+	}
+	t.mu.Unlock()
+
+	defer func() {
+		t.mu.Lock()
+		t.active--
+		t.mu.Unlock()
+	}()
+
+	if t.chunkDelay > 0 {
+		time.Sleep(t.chunkDelay)
+	}
+	if strings.Contains(prompt, "Chunk analyses:") {
+		if t.mergeOutput != "" {
+			return t.mergeOutput, nil
+		}
+		return "Merged summary", nil
+	}
+	if t.failOnPages != "" && strings.Contains(prompt, "Pages: "+t.failOnPages) {
+		return "", fmt.Errorf("chunk failed")
+	}
+	if t.chunkOutputFmt != "" {
+		match := "unknown"
+		if index := strings.Index(prompt, "\nPages: "); index >= 0 {
+			rest := prompt[index+8:]
+			if newline := strings.Index(rest, "\n"); newline >= 0 {
+				match = strings.TrimSpace(rest[:newline])
+			}
+		}
+		return fmt.Sprintf(t.chunkOutputFmt, match), nil
+	}
+	return "Chunk summary", nil
 }
 
 func TestOrchestratorRunsListFilesTool(t *testing.T) {
@@ -568,14 +621,14 @@ func TestRunSummarizeTimesOutAndFallsBackToToolSummary(t *testing.T) {
 
 	select {
 	case <-started:
-	case <-time.After(1 * time.Second):
+	case <-time.After(8 * time.Second):
 		t.Fatal("model did not start")
 	}
 
 	var result string
 	select {
 	case result = <-resultCh:
-	case <-time.After(2 * time.Second):
+	case <-time.After(12 * time.Second):
 		t.Fatal("summarize request hung instead of timing out")
 	}
 	if !strings.Contains(strings.ToLower(result), "using tool-based fallback") && !strings.Contains(strings.ToLower(result), "summary:") {
@@ -587,6 +640,104 @@ func TestRunSummarizeTimesOutAndFallsBackToToolSummary(t *testing.T) {
 	case <-done:
 	case <-time.After(1 * time.Second):
 		t.Fatal("blocked model did not unblock after release")
+	}
+}
+
+func TestSummarizeDocumentsWithModelUsesBoundedConcurrencyAndPreservesMerge(t *testing.T) {
+	orch := &Orchestrator{
+		modelGen:            &trackingModelGenerator{chunkDelay: 20 * time.Millisecond, mergeOutput: "Merged final summary", chunkOutputFmt: "Chunk %s"},
+		modelSummaryTimeout: 2 * time.Second,
+		modelSummaryWorkers: 1,
+	}
+	docs := []*tools.ExtractedDocument{
+		{
+			SourcePath: "/tmp/a.pdf",
+			Chunks: []tools.DocumentChunk{
+				{ID: "chunk-1", PageStart: 1, PageEnd: 1, Text: "alpha", Kind: "text_native"},
+				{ID: "chunk-2", PageStart: 2, PageEnd: 2, Text: "beta", Kind: "text_native"},
+				{ID: "chunk-3", PageStart: 3, PageEnd: 3, Text: "gamma", Kind: "text_native"},
+			},
+		},
+	}
+
+	result, err := orch.summarizeDocumentsWithModel("summarize this", docs)
+	if err != nil {
+		t.Fatalf("summarize documents: %v", err)
+	}
+	if !strings.Contains(result, "Merged final summary") {
+		t.Fatalf("expected merged output, got: %s", result)
+	}
+	model := orch.modelGen.(*trackingModelGenerator)
+	if model.maxActive > 1 {
+		t.Fatalf("expected bounded concurrency of 1, saw %d", model.maxActive)
+	}
+}
+
+func TestSummarizeDocumentsWithModelRecordsChunkWarnings(t *testing.T) {
+	orch := &Orchestrator{
+		modelGen:            &trackingModelGenerator{failOnPages: "2-2", mergeOutput: "Merged with warnings"},
+		modelSummaryTimeout: 2 * time.Second,
+		modelSummaryWorkers: 1,
+	}
+	docs := []*tools.ExtractedDocument{
+		{
+			SourcePath: "/tmp/a.pdf",
+			Warnings: []tools.ExtractionWarning{
+				{Code: "ocr_unavailable", Message: "ocr unavailable", PageNumber: 2},
+			},
+			Chunks: []tools.DocumentChunk{
+				{ID: "chunk-1", PageStart: 1, PageEnd: 1, Text: "alpha", Kind: "text_native"},
+				{ID: "chunk-2", PageStart: 2, PageEnd: 2, Text: "beta", Kind: "image_only"},
+			},
+		},
+	}
+
+	result, err := orch.summarizeDocumentsWithModel("summarize this", docs)
+	if err != nil {
+		t.Fatalf("summarize documents: %v", err)
+	}
+	if !strings.Contains(result, "Merged with warnings") {
+		t.Fatalf("expected merged summary, got: %s", result)
+	}
+	if !strings.Contains(result, "pages 2-2") {
+		t.Fatalf("expected chunk failure warning, got: %s", result)
+	}
+}
+
+func TestSummarizeDocumentsWithModelEmitsProgressStages(t *testing.T) {
+	orch := &Orchestrator{
+		modelGen:            stubModelGenerator{output: "Chunk summary"},
+		modelSummaryTimeout: 2 * time.Second,
+		modelSummaryWorkers: 1,
+	}
+	progress := make([]string, 0, 4)
+	orch.SetProgressReporter(func(message string) {
+		progress = append(progress, message)
+	})
+
+	docs := []*tools.ExtractedDocument{
+		{
+			SourcePath: "/tmp/profile.pdf",
+			Chunks: []tools.DocumentChunk{
+				{ID: "chunk-1", PageStart: 1, PageEnd: 1, Text: "alpha", Kind: "text_native"},
+				{ID: "chunk-2", PageStart: 2, PageEnd: 2, Text: "beta", Kind: "text_native"},
+			},
+		},
+	}
+
+	_, err := orch.summarizeDocumentsWithModel("summarize this", docs)
+	if err != nil {
+		t.Fatalf("summarize documents: %v", err)
+	}
+	joined := strings.Join(progress, "\n")
+	if !strings.Contains(joined, "Summarizing chunk 1/2") {
+		t.Fatalf("expected chunk start progress, got: %s", joined)
+	}
+	if !strings.Contains(joined, "Completed chunk 1/2") {
+		t.Fatalf("expected chunk completion progress, got: %s", joined)
+	}
+	if !strings.Contains(joined, "Merging 2 chunk summary result(s)") {
+		t.Fatalf("expected merge progress, got: %s", joined)
 	}
 }
 

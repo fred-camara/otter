@@ -60,7 +60,13 @@ func main() {
 			fmt.Fprintf(os.Stderr, "orchestrator init error: %v\n", err)
 			os.Exit(1)
 		}
-		if err := runChatREPL(os.Stdin, os.Stdout, func(task string) string { return orch.RunWithMode(task, "chat") }); err != nil {
+		if err := runChatREPL(os.Stdin, os.Stdout, func(task string) string {
+			orch.SetProgressReporter(func(message string) {
+				fmt.Fprintln(os.Stdout, "… "+message)
+			})
+			defer orch.SetProgressReporter(nil)
+			return orch.RunWithMode(task, "chat")
+		}); err != nil {
 			fmt.Fprintf(os.Stderr, "chat error: %v\n", err)
 			os.Exit(1)
 		}

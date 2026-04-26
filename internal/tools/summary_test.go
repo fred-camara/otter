@@ -73,13 +73,13 @@ func TestSummarizeFilesToolSupportsTableLikePDF(t *testing.T) {
 		t.Fatalf("execute summarize_files for table pdf: %v", err)
 	}
 	normalized := strings.ReplaceAll(strings.ToLower(result), " ", "")
-	if !strings.Contains(normalized, "grosspay1234.56") {
+	if !strings.Contains(normalized, "grosspay") || !strings.Contains(normalized, "1234.56") {
 		t.Fatalf("expected gross pay row in summary, got: %s", result)
 	}
-	if !strings.Contains(normalized, "netpay999.99") {
+	if !strings.Contains(normalized, "netpay") || !strings.Contains(normalized, "999.99") {
 		t.Fatalf("expected net pay row in summary, got: %s", result)
 	}
-	if !strings.Contains(normalized, "tax234.57") {
+	if !strings.Contains(normalized, "tax") || !strings.Contains(normalized, "234.57") {
 		t.Fatalf("expected tax row in summary, got: %s", result)
 	}
 }

@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -62,15 +62,16 @@ func (t *ReadFileTool) Execute(input json.RawMessage) (string, error) {
 		return "", errors.New("hidden paths are not allowed")
 	}
 
-	content, err := os.ReadFile(absPath)
+	text, err := ExtractSummarizableText(absPath, t.allowedDirs)
 	if err != nil {
+		if strings.EqualFold(filepath.Ext(absPath), ".pdf") {
+			return "", fmt.Errorf("read pdf: %w", err)
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "binary files are not supported") {
+			return "", errors.New("binary files are not supported")
+		}
 		return "", fmt.Errorf("read file: %w", err)
 	}
-	if !isTextLike(content) {
-		return "", errors.New("binary files are not supported")
-	}
-
-	text := string(content)
 	if len(text) > 16000 {
 		text = text[:16000] + "\n...[truncated]"
 	}

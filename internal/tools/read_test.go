@@ -25,3 +25,21 @@ func TestReadFileToolReadsTextFile(t *testing.T) {
 		t.Fatalf("expected file content, got: %s", result)
 	}
 }
+
+func TestReadFileToolReadsPDFViaExtractor(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "cv.pdf")
+	if err := os.WriteFile(path, buildMinimalPDF("Frederic Camara CV"), 0o644); err != nil {
+		t.Fatalf("write cv.pdf: %v", err)
+	}
+
+	tool := NewReadFileTool([]string{root})
+	input, _ := json.Marshal(map[string]string{"path": path})
+	result, err := tool.Execute(input)
+	if err != nil {
+		t.Fatalf("execute read_file for pdf: %v", err)
+	}
+	if !strings.Contains(result, "Frederic Camara CV") {
+		t.Fatalf("expected extracted pdf content, got: %s", result)
+	}
+}
