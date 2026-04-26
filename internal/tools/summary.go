@@ -126,6 +126,12 @@ func extractPDFText(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	rowText, err := extractPDFTextByRows(reader)
+	if err != nil {
+		return "", err
+	}
+
 	plainTextReader, err := reader.GetPlainText()
 	if err != nil {
 		return "", err
@@ -135,11 +141,74 @@ func extractPDFText(path string) (string, error) {
 		return "", err
 	}
 
-	text := strings.TrimSpace(string(raw))
+	plainText := strings.TrimSpace(string(raw))
+	if len(plainText) > 64000 {
+		plainText = plainText[:64000]
+	}
+
+	if preferStructuredPDFText(rowText, plainText) {
+		return rowText, nil
+	}
+	return plainText, nil
+}
+
+func extractPDFTextByRows(reader *pdf.Reader) (string, error) {
+	pages := reader.NumPage()
+	if pages == 0 {
+		return "", nil
+	}
+
+	lines := make([]string, 0, 64)
+	for i := 1; i <= pages; i++ {
+		page := reader.Page(i)
+		rows, err := page.GetTextByRow()
+		if err != nil {
+			return "", err
+		}
+		for _, row := range rows {
+			parts := make([]string, 0, len(row.Content))
+			for _, item := range row.Content {
+				part := strings.TrimSpace(item.S)
+				if part != "" {
+					parts = append(parts, part)
+				}
+			}
+			if len(parts) == 0 {
+				continue
+			}
+			line := strings.Join(parts, " ")
+			line = strings.Join(strings.Fields(line), " ")
+			if line != "" {
+				lines = append(lines, line)
+			}
+		}
+	}
+
+	text := strings.TrimSpace(strings.Join(lines, "\n"))
 	if len(text) > 64000 {
 		text = text[:64000]
 	}
 	return text, nil
+}
+
+func preferStructuredPDFText(rowText, plainText string) bool {
+	rowText = strings.TrimSpace(rowText)
+	plainText = strings.TrimSpace(plainText)
+	if rowText == "" {
+		return false
+	}
+	if plainText == "" {
+		return true
+	}
+	rowLines := 1 + strings.Count(rowText, "\n")
+	plainLines := 1 + strings.Count(plainText, "\n")
+	if rowLines > 1 && rowLines >= plainLines/2 {
+		return true
+	}
+	if len(rowText) >= int(float64(len(plainText))*0.75) {
+		return true
+	}
+	return false
 }
 
 func sanitizeExtractedText(text string) string {

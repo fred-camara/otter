@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"otter/internal/audit"
 	"otter/internal/planner"
@@ -25,6 +27,12 @@ type stubModelGenerator struct {
 	err    error
 }
 
+type blockingModelGenerator struct {
+	started chan struct{}
+	release chan struct{}
+	done    chan struct{}
+}
+
 func (s stubPlanner) Plan(_ context.Context, _ planner.Request) (planner.Response, error) {
 	if s.err != nil {
 		return planner.Response{}, s.err
@@ -37,6 +45,19 @@ func (s stubModelGenerator) Generate(_ string) (string, error) {
 		return "", s.err
 	}
 	return s.output, nil
+}
+
+func (b *blockingModelGenerator) Generate(_ string) (string, error) {
+	if b.started != nil {
+		close(b.started)
+	}
+	if b.release != nil {
+		<-b.release
+	}
+	if b.done != nil {
+		close(b.done)
+	}
+	return "blocked model output", nil
 }
 
 func TestOrchestratorRunsListFilesTool(t *testing.T) {
@@ -243,6 +264,114 @@ func TestRunComposedListFilesDesktopAndDownloads(t *testing.T) {
 	}
 }
 
+func TestRunComposedListFilesDesktopThenDownloadsShorthand(t *testing.T) {
+	home := t.TempDir()
+	desktop := filepath.Join(home, "Desktop")
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(desktop, 0o755); err != nil {
+		t.Fatalf("mkdir desktop: %v", err)
+	}
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		t.Fatalf("mkdir downloads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(desktop, "desktop-short.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed desktop file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "downloads-short.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed downloads file: %v", err)
+	}
+	t.Setenv("HOME", home)
+
+	orch, err := NewOrchestrator([]string{desktop, downloads}, stubPlanner{err: fmt.Errorf("planner should not run")})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.RunWithMode("please list the files in desktop and then downloads", "chat")
+	if !strings.Contains(result, "Visible entries in "+desktop) {
+		t.Fatalf("expected desktop listing, got: %s", result)
+	}
+	if !strings.Contains(result, "desktop-short.txt") {
+		t.Fatalf("expected desktop file in output, got: %s", result)
+	}
+	if !strings.Contains(result, "Visible entries in "+downloads) {
+		t.Fatalf("expected downloads listing, got: %s", result)
+	}
+	if !strings.Contains(result, "downloads-short.txt") {
+		t.Fatalf("expected downloads file in output, got: %s", result)
+	}
+}
+
+func TestRunComposedListFilesDesktopThenDowloadsTypo(t *testing.T) {
+	home := t.TempDir()
+	desktop := filepath.Join(home, "Desktop")
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(desktop, 0o755); err != nil {
+		t.Fatalf("mkdir desktop: %v", err)
+	}
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		t.Fatalf("mkdir downloads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(desktop, "desktop-typo.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed desktop file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "downloads-typo.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed downloads file: %v", err)
+	}
+	t.Setenv("HOME", home)
+
+	orch, err := NewOrchestrator([]string{desktop, downloads}, stubPlanner{err: fmt.Errorf("planner should not run")})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.RunWithMode("list the files in desktop and then dowloads", "chat")
+	if !strings.Contains(result, "Visible entries in "+desktop) {
+		t.Fatalf("expected desktop listing, got: %s", result)
+	}
+	if !strings.Contains(result, "Visible entries in "+downloads) {
+		t.Fatalf("expected downloads listing despite typo alias, got: %s", result)
+	}
+	if !strings.Contains(result, "downloads-typo.txt") {
+		t.Fatalf("expected downloads file in output, got: %s", result)
+	}
+}
+
+func TestRunComposedListFilesDesktopsAndDownloadsPlural(t *testing.T) {
+	home := t.TempDir()
+	desktop := filepath.Join(home, "Desktop")
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(desktop, 0o755); err != nil {
+		t.Fatalf("mkdir desktop: %v", err)
+	}
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		t.Fatalf("mkdir downloads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(desktop, "desktop-plural.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed desktop file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "downloads-plural.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed downloads file: %v", err)
+	}
+	t.Setenv("HOME", home)
+
+	orch, err := NewOrchestrator([]string{desktop, downloads}, stubPlanner{err: fmt.Errorf("planner should not run")})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.RunWithMode("list the files in desktops and downloads", "chat")
+	if !strings.Contains(result, "Visible entries in "+desktop) {
+		t.Fatalf("expected desktop listing, got: %s", result)
+	}
+	if !strings.Contains(result, "Visible entries in "+downloads) {
+		t.Fatalf("expected downloads listing, got: %s", result)
+	}
+	if !strings.Contains(result, "desktop-plural.txt") || !strings.Contains(result, "downloads-plural.txt") {
+		t.Fatalf("expected both files in output, got: %s", result)
+	}
+}
+
 func TestRunComposedReadThenSummarize(t *testing.T) {
 	root := t.TempDir()
 	filePath := filepath.Join(root, "notes.txt")
@@ -408,6 +537,56 @@ func TestRunSummarizeShowsExplicitFallbackWhenModelFails(t *testing.T) {
 	}
 	if !strings.Contains(result, "Summary:") {
 		t.Fatalf("expected fallback summary body, got: %s", result)
+	}
+}
+
+func TestRunSummarizeTimesOutAndFallsBackToToolSummary(t *testing.T) {
+	root := t.TempDir()
+	pdfPath := filepath.Join(root, "cv.pdf")
+	if err := os.WriteFile(pdfPath, buildMinimalPDF("Frederic Camara CV"), 0o644); err != nil {
+		t.Fatalf("seed pdf: %v", err)
+	}
+
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{output: `not json`})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	orch.modelGen = &blockingModelGenerator{
+		started: started,
+		release: release,
+		done:    done,
+	}
+	orch.modelSummaryTimeout = 20 * time.Millisecond
+
+	resultCh := make(chan string, 1)
+	go func() {
+		resultCh <- orch.Run("summarize this file: " + pdfPath)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(1 * time.Second):
+		t.Fatal("model did not start")
+	}
+
+	var result string
+	select {
+	case result = <-resultCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("summarize request hung instead of timing out")
+	}
+	if !strings.Contains(strings.ToLower(result), "using tool-based fallback") && !strings.Contains(strings.ToLower(result), "summary:") {
+		t.Fatalf("expected fallback summary after timeout, got: %s", result)
+	}
+
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("blocked model did not unblock after release")
 	}
 }
 
@@ -1150,4 +1329,39 @@ func TestCleanupAccessDeniedMessageIncludesAttemptedAndAllowedRoots(t *testing.T
 	if !strings.Contains(strings.ToLower(reply), "allow access") {
 		t.Fatalf("expected actionable grant phrase in denial, got: %s", reply)
 	}
+}
+
+func buildMinimalPDF(text string) []byte {
+	escaped := strings.NewReplacer(`\`, `\\`, `(`, `\(`, `)`, `\)`).Replace(text)
+	stream := "BT /F1 18 Tf 50 100 Td (" + escaped + ") Tj ET"
+
+	objects := []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(stream), stream),
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+	}
+
+	var out bytes.Buffer
+	out.WriteString("%PDF-1.4\n")
+	offsets := make([]int, 0, len(objects))
+	for index, object := range objects {
+		offsets = append(offsets, out.Len())
+		out.WriteString(fmt.Sprintf("%d 0 obj\n%s\nendobj\n", index+1, object))
+	}
+
+	xrefOffset := out.Len()
+	out.WriteString("xref\n")
+	out.WriteString(fmt.Sprintf("0 %d\n", len(objects)+1))
+	out.WriteString("0000000000 65535 f \n")
+	for _, offset := range offsets {
+		out.WriteString(fmt.Sprintf("%010d 00000 n \n", offset))
+	}
+	out.WriteString("trailer\n")
+	out.WriteString(fmt.Sprintf("<< /Size %d /Root 1 0 R >>\n", len(objects)+1))
+	out.WriteString("startxref\n")
+	out.WriteString(fmt.Sprintf("%d\n", xrefOffset))
+	out.WriteString("%%EOF\n")
+	return out.Bytes()
 }

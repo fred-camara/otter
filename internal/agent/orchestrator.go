@@ -28,19 +28,21 @@ import (
 )
 
 const (
-	defaultModelName = "qwen2.5-coder:14b"
-	defaultOllamaURL = "http://127.0.0.1:11434"
-	maxPlanRetries   = 2
+	defaultModelName           = "qwen2.5-coder:14b"
+	defaultOllamaURL           = "http://127.0.0.1:11434"
+	maxPlanRetries             = 2
+	defaultModelSummaryTimeout = 120 * time.Second
 )
 
 type Orchestrator struct {
-	registry       *tools.Registry
-	planner        planner.Planner
-	modelGen       model.Interface
-	allowedDirs    []string
-	modelName      string
-	audit          *audit.Logger
-	pendingCleanup *pendingCleanupContext
+	registry            *tools.Registry
+	planner             planner.Planner
+	modelGen            model.Interface
+	allowedDirs         []string
+	modelName           string
+	audit               *audit.Logger
+	modelSummaryTimeout time.Duration
+	pendingCleanup      *pendingCleanupContext
 }
 
 type pendingCleanupContext struct {
@@ -68,9 +70,10 @@ func NewOrchestrator(allowedDirs []string, planner planner.Planner) (*Orchestrat
 	moveTool := tools.NewMoveFileTool(normalizedDirs)
 
 	return &Orchestrator{
-		registry:    tools.NewRegistry(listTool, readTool, summarizeTool, writeTool, moveTool),
-		planner:     planner,
-		allowedDirs: normalizedDirs,
+		registry:            tools.NewRegistry(listTool, readTool, summarizeTool, writeTool, moveTool),
+		planner:             planner,
+		allowedDirs:         normalizedDirs,
+		modelSummaryTimeout: defaultModelSummaryTimeout,
 	}, nil
 }
 
@@ -1078,10 +1081,10 @@ func (o *Orchestrator) handleSummarizeWithModelTask(task string) (string, bool) 
 		if len(text) > 12000 {
 			text = text[:12000] + "\n...[truncated]"
 		}
-		contextByPath[path] = text
+		contextByPath[path] = buildModelSummaryContext(path, text)
 	}
 
-	output, err := o.modelGen.Generate(buildModelSummaryPrompt(task, contextByPath))
+	output, err := o.generateModelSummaryWithTimeout(buildModelSummaryPrompt(task, contextByPath))
 	if err != nil {
 		o.logAuditError("model_summary", err)
 		fallback := o.executeToolCall(task, call)
@@ -1095,6 +1098,35 @@ func (o *Orchestrator) handleSummarizeWithModelTask(task string) (string, bool) 
 	return "🦦 " + output, true
 }
 
+func (o *Orchestrator) generateModelSummaryWithTimeout(prompt string) (string, error) {
+	if o.modelGen == nil {
+		return "", fmt.Errorf("model not configured")
+	}
+	timeout := o.modelSummaryTimeout
+	if timeout <= 0 {
+		timeout = defaultModelSummaryTimeout
+	}
+
+	type result struct {
+		output string
+		err    error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		output, err := o.modelGen.Generate(prompt)
+		ch <- result{output: output, err: err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case res := <-ch:
+		return res.output, res.err
+	case <-timer.C:
+		return "", fmt.Errorf("timed out after %s", timeout)
+	}
+}
+
 func buildModelSummaryPrompt(task string, contextByPath map[string]string) string {
 	paths := make([]string, 0, len(contextByPath))
 	for path := range contextByPath {
@@ -1103,15 +1135,15 @@ func buildModelSummaryPrompt(task string, contextByPath map[string]string) strin
 	sort.Strings(paths)
 
 	builder := strings.Builder{}
-	builder.WriteString("You are Otter. Summarize the provided file contents for the user.\n")
+	builder.WriteString("You are Otter. Summarize the provided document for the user.\n")
 	builder.WriteString("Return concise markdown with:\n")
-	builder.WriteString("- One short overview paragraph\n")
-	builder.WriteString("- Bullet points of key facts\n")
-	builder.WriteString("- Optional concerns/missing info\n\n")
+	builder.WriteString("- one short overview paragraph\n")
+	builder.WriteString("- key facts\n")
+	builder.WriteString("- optional concerns or missing info\n\n")
 	builder.WriteString("User request: ")
 	builder.WriteString(task)
 	builder.WriteString("\n\n")
-	builder.WriteString("File contexts:\n")
+	builder.WriteString("Document contexts:\n")
 	for _, path := range paths {
 		builder.WriteString("### ")
 		builder.WriteString(path)
@@ -1120,6 +1152,54 @@ func buildModelSummaryPrompt(task string, contextByPath map[string]string) strin
 		builder.WriteString("\n\n")
 	}
 	return builder.String()
+}
+
+func buildModelSummaryContext(path, text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return "No extractable text."
+	}
+
+	hint := detectDocumentTypeHint(trimmed)
+
+	lines := strings.Split(trimmed, "\n")
+	previewLines := 8
+	if len(lines) < previewLines {
+		previewLines = len(lines)
+	}
+	excerpt := strings.Join(lines[:previewLines], "\n")
+	if len(excerpt) > 2400 {
+		excerpt = excerpt[:2400] + "\n...[truncated]"
+	}
+
+	builder := strings.Builder{}
+	if hint != "" {
+		builder.WriteString("Document type hint: ")
+		builder.WriteString(hint)
+		builder.WriteString("\n")
+	}
+	builder.WriteString("Extracted text preview for ")
+	builder.WriteString(filepath.Base(path))
+	builder.WriteString(":\n")
+	builder.WriteString(excerpt)
+	builder.WriteString("\n\n")
+	builder.WriteString("Full extracted text length: ")
+	builder.WriteString(fmt.Sprintf("%d chars", len(trimmed)))
+	return builder.String()
+}
+
+func detectDocumentTypeHint(text string) string {
+	lower := strings.ToLower(text)
+	switch {
+	case strings.Contains(lower, "payslip") || strings.Contains(lower, "pay slip") || strings.Contains(lower, "gross pay") || strings.Contains(lower, "net pay"):
+		return "payslip. Extract employer, pay period, gross pay, net pay, tax, and any totals."
+	case strings.Contains(lower, "invoice") || strings.Contains(lower, "amount due") || strings.Contains(lower, "subtotal"):
+		return "invoice. Extract vendor, invoice date, amount due, subtotal, tax, and total."
+	case strings.Contains(lower, "receipt") || strings.Contains(lower, "total") || strings.Contains(lower, "tax"):
+		return "receipt. Extract merchant, date, line items, tax, and total."
+	default:
+		return ""
+	}
 }
 
 func (o *Orchestrator) resolveSummarizePaths(paths []string) ([]string, error) {
@@ -1623,7 +1703,9 @@ func normalizePathAlias(value string) string {
 		return "~/Downloads"
 	case "downlaods", "my downlaods", "the downlaods":
 		return "~/Downloads"
-	case "desktop", "my desktop", "the desktop":
+	case "dowloads", "my dowloads", "the dowloads":
+		return "~/Downloads"
+	case "desktop", "desktops", "my desktop", "my desktops", "the desktop", "the desktops":
 		return "~/Desktop"
 	case "documents", "my documents", "the documents":
 		return "~/Documents"
@@ -1969,19 +2051,28 @@ func parseComposedListFilesPaths(task string) []string {
 	if strings.TrimSpace(task) == "" {
 		return nil
 	}
-	connectorRe := regexp.MustCompile(`(?i)\b(?:and then|then|and)\b`)
-	parts := connectorRe.Split(task, -1)
+	listPrefixRe := regexp.MustCompile(`(?i)(?:list|show(?:\s+me)?)\s+(?:the\s+)?files\s+in\s+`)
+	loc := listPrefixRe.FindStringIndex(task)
+	if len(loc) != 2 {
+		return nil
+	}
+	remainder := strings.TrimSpace(task[loc[1]:])
+	if remainder == "" {
+		return nil
+	}
+	connectorRe := regexp.MustCompile(`(?i)\s+(?:and then|then|and)\s+`)
+	parts := connectorRe.Split(remainder, -1)
 	if len(parts) < 2 {
 		return nil
 	}
-	pathRe := regexp.MustCompile(`(?i)(?:list|show(?:\s+me)?)\s+(?:the\s+)?files\s+in\s+(.+)$`)
 	paths := make([]string, 0, len(parts))
 	for _, part := range parts {
-		match := pathRe.FindStringSubmatch(strings.TrimSpace(part))
-		if len(match) < 2 {
+		candidatePart := strings.TrimSpace(part)
+		if candidatePart == "" {
 			continue
 		}
-		candidate := normalizePathAlias(match[1])
+		candidatePart = listPrefixRe.ReplaceAllString(candidatePart, "")
+		candidate := normalizePathAlias(candidatePart)
 		if candidate == "" {
 			continue
 		}
