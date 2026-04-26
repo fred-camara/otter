@@ -712,6 +712,11 @@ func (o *Orchestrator) handleConversationalTask(task string) (string, bool) {
 	if lower == "" {
 		return "", false
 	}
+	// If a message mixes a greeting with an actionable request
+	// (e.g. "hey can you list files..."), prefer task execution.
+	if isLikelyToolRequest(lower) {
+		return "", false
+	}
 	if !isLikelyConversationalInput(trimmed) {
 		return "", false
 	}
@@ -897,7 +902,7 @@ func coerceListFilesInput(raw json.RawMessage, task string) json.RawMessage {
 	if index := strings.LastIndex(lowered, " in "); index >= 0 {
 		candidate := strings.TrimSpace(task[index+4:])
 		if candidate != "" {
-			pathValue = sanitizeTaskPath(candidate)
+			pathValue = normalizePathAlias(candidate)
 		}
 	}
 
@@ -945,13 +950,13 @@ func (o *Orchestrator) directToolCallForTask(task string) (ToolCall, bool) {
 		return call, true
 	}
 
-	if strings.HasPrefix(lowered, "list files") {
+	if isListFilesRequest(lowered) {
 		pathValue := "."
 		if strings.Contains(lowered, " in ") {
 			index := strings.LastIndex(lowered, " in ")
 			candidate := strings.TrimSpace(trimmed[index+4:])
 			if candidate != "" {
-				pathValue = candidate
+				pathValue = normalizePathAlias(candidate)
 			}
 		}
 		input, _ := json.Marshal(map[string]string{"path": pathValue})
@@ -1611,6 +1616,48 @@ func sanitizeTaskPath(value string) string {
 	return clean
 }
 
+func normalizePathAlias(value string) string {
+	clean := sanitizeTaskPath(value)
+	switch strings.ToLower(strings.TrimSpace(clean)) {
+	case "downloads", "my downloads", "the downloads":
+		return "~/Downloads"
+	case "downlaods", "my downlaods", "the downlaods":
+		return "~/Downloads"
+	case "desktop", "my desktop", "the desktop":
+		return "~/Desktop"
+	case "documents", "my documents", "the documents":
+		return "~/Documents"
+	case "music", "my music":
+		return "~/Music"
+	case "pictures", "my pictures", "photos", "my photos":
+		return "~/Pictures"
+	case "movies", "my movies", "videos", "my videos":
+		return "~/Movies"
+	case "notes", "my notes":
+		return "~/notes"
+	default:
+		return clean
+	}
+}
+
+func isListFilesRequest(taskLower string) bool {
+	if strings.HasPrefix(taskLower, "list files") || strings.HasPrefix(taskLower, "list the files") {
+		return true
+	}
+	if strings.HasPrefix(taskLower, "show files") || strings.HasPrefix(taskLower, "show me files") {
+		return true
+	}
+	// Allow conversational prefixes/suffixes around the core intent, e.g.
+	// "cool now list the files in downloads".
+	if strings.Contains(taskLower, "list files") || strings.Contains(taskLower, "list the files") {
+		return true
+	}
+	if strings.Contains(taskLower, "show files") || strings.Contains(taskLower, "show me files") {
+		return true
+	}
+	return false
+}
+
 func stripTaskFlags(value string) string {
 	clean := strings.TrimSpace(value)
 	for {
@@ -1905,11 +1952,117 @@ func (o *Orchestrator) helpMessage() string {
 func (o *Orchestrator) handleComposedTask(task string) (string, bool) {
 	trimmed := strings.TrimSpace(task)
 	lower := strings.ToLower(trimmed)
+	if paths := parseComposedListFilesPaths(trimmed); len(paths) >= 2 {
+		return o.runComposedListFilesTask(paths), true
+	}
+	if paths := parseReadThenSummarizePaths(trimmed); len(paths) > 0 {
+		return o.runReadThenSummarizeTask(paths), true
+	}
 	if strings.HasPrefix(lower, "read ") && strings.Contains(lower, " then write ") {
 		response := o.runReadAndWriteTask(trimmed)
 		return response, true
 	}
 	return "", false
+}
+
+func parseComposedListFilesPaths(task string) []string {
+	if strings.TrimSpace(task) == "" {
+		return nil
+	}
+	connectorRe := regexp.MustCompile(`(?i)\b(?:and then|then|and)\b`)
+	parts := connectorRe.Split(task, -1)
+	if len(parts) < 2 {
+		return nil
+	}
+	pathRe := regexp.MustCompile(`(?i)(?:list|show(?:\s+me)?)\s+(?:the\s+)?files\s+in\s+(.+)$`)
+	paths := make([]string, 0, len(parts))
+	for _, part := range parts {
+		match := pathRe.FindStringSubmatch(strings.TrimSpace(part))
+		if len(match) < 2 {
+			continue
+		}
+		candidate := normalizePathAlias(match[1])
+		if candidate == "" {
+			continue
+		}
+		paths = append(paths, candidate)
+	}
+	unique := uniqueStrings(paths)
+	if len(unique) < 2 {
+		return nil
+	}
+	return unique
+}
+
+func (o *Orchestrator) runComposedListFilesTask(paths []string) string {
+	results := make([]string, 0, len(paths))
+	for _, pathValue := range paths {
+		input, _ := json.Marshal(map[string]string{"path": pathValue})
+		result, err := o.runTool("list_files", input)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "outside allowed directories") {
+				return fmt.Sprintf("🦦 %v\n\n%s", err, o.accessGuidance())
+			}
+			return fmt.Sprintf("🦦 Tool error: %v", err)
+		}
+		results = append(results, result)
+	}
+	return "🦦 " + strings.Join(results, "\n\n")
+}
+
+func parseReadThenSummarizePaths(task string) []string {
+	re := regexp.MustCompile(`(?i)\bread\s+(.+?)\s+(?:and then|then)\s+summar(?:ize|ise)\b`)
+	matches := re.FindStringSubmatch(strings.TrimSpace(task))
+	if len(matches) < 2 {
+		return nil
+	}
+	chunk := strings.TrimSpace(matches[1])
+	if chunk == "" {
+		return nil
+	}
+
+	candidates := make([]string, 0, 4)
+	for _, part := range strings.Split(chunk, " and ") {
+		for _, item := range strings.Split(part, ",") {
+			candidate := sanitizeTaskPath(item)
+			candidate = strings.TrimSpace(strings.Trim(candidate, ","))
+			if candidate != "" {
+				candidates = append(candidates, candidate)
+			}
+		}
+	}
+	candidates = uniqueStrings(candidates)
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	explicitPathLike := false
+	for _, candidate := range candidates {
+		if looksPathLike(candidate) || strings.Contains(filepath.Base(candidate), ".") {
+			explicitPathLike = true
+			break
+		}
+	}
+	if !explicitPathLike {
+		return nil
+	}
+	return candidates
+}
+
+func (o *Orchestrator) runReadThenSummarizeTask(paths []string) string {
+	resolved, err := o.resolveSummarizePaths(paths)
+	if err != nil {
+		return "🦦 " + err.Error()
+	}
+	input, _ := json.Marshal(map[string][]string{"paths": resolved})
+	result, runErr := o.runTool("summarize_files", input)
+	if runErr != nil {
+		if strings.Contains(strings.ToLower(runErr.Error()), "outside allowed directories") {
+			return fmt.Sprintf("🦦 %v\n\n%s", runErr, o.accessGuidance())
+		}
+		return fmt.Sprintf("🦦 Tool error: %v", runErr)
+	}
+	return "🦦 " + result
 }
 
 func (o *Orchestrator) runReadAndWriteTask(task string) string {

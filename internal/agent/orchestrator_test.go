@@ -83,6 +83,31 @@ func TestConversationalInputBypassesPlanner(t *testing.T) {
 	}
 }
 
+func TestGreetingWithActionableListIntentExecutesTool(t *testing.T) {
+	home := t.TempDir()
+	desktop := filepath.Join(home, "Desktop")
+	if err := os.MkdirAll(desktop, 0o755); err != nil {
+		t.Fatalf("mkdir desktop: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(desktop, "note.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed desktop file: %v", err)
+	}
+	t.Setenv("HOME", home)
+
+	orch, err := NewOrchestrator([]string{desktop}, stubPlanner{err: fmt.Errorf("planner should not run")})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.RunWithMode("hey can you list the files in desktop", "chat")
+	if !strings.Contains(result, "Visible entries in") {
+		t.Fatalf("expected list output, got: %s", result)
+	}
+	if !strings.Contains(result, "note.txt") {
+		t.Fatalf("expected desktop file in output, got: %s", result)
+	}
+}
+
 func TestInvalidPlannerJSONConversationalFallback(t *testing.T) {
 	root := t.TempDir()
 	orch, err := NewOrchestrator([]string{root}, stubPlanner{output: "definitely not json"})
@@ -149,6 +174,93 @@ func TestDirectToolCallForTaskListFiles(t *testing.T) {
 	}
 	if !strings.Contains(string(call.Input), `"~/Downloads"`) {
 		t.Fatalf("expected path in input, got %s", string(call.Input))
+	}
+}
+
+func TestDirectToolCallForTaskListFilesNaturalLanguageDesktop(t *testing.T) {
+	orch := &Orchestrator{allowedDirs: []string{"."}}
+	call, ok := orch.directToolCallForTask("list the files in desktop")
+	if !ok {
+		t.Fatalf("expected direct tool call")
+	}
+	if call.Tool != "list_files" {
+		t.Fatalf("expected list_files, got %q", call.Tool)
+	}
+	if !strings.Contains(string(call.Input), `"~/Desktop"`) {
+		t.Fatalf("expected desktop alias to normalize to ~/Desktop, got %s", string(call.Input))
+	}
+}
+
+func TestDirectToolCallForTaskListFilesVerboseDownloads(t *testing.T) {
+	orch := &Orchestrator{allowedDirs: []string{"."}}
+	call, ok := orch.directToolCallForTask("cool now list the files in downloads")
+	if !ok {
+		t.Fatalf("expected direct tool call")
+	}
+	if call.Tool != "list_files" {
+		t.Fatalf("expected list_files, got %q", call.Tool)
+	}
+	if !strings.Contains(string(call.Input), `"~/Downloads"`) {
+		t.Fatalf("expected downloads alias to normalize to ~/Downloads, got %s", string(call.Input))
+	}
+}
+
+func TestRunComposedListFilesDesktopAndDownloads(t *testing.T) {
+	home := t.TempDir()
+	desktop := filepath.Join(home, "Desktop")
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(desktop, 0o755); err != nil {
+		t.Fatalf("mkdir desktop: %v", err)
+	}
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		t.Fatalf("mkdir downloads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(desktop, "desktop-note.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed desktop file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloads, "downloads-note.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed downloads file: %v", err)
+	}
+	t.Setenv("HOME", home)
+
+	orch, err := NewOrchestrator([]string{desktop, downloads}, stubPlanner{err: fmt.Errorf("planner should not run")})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.RunWithMode("Hey can you list the files in Desktop and then list the files in downlaods", "chat")
+	if !strings.Contains(result, "Visible entries in "+desktop) {
+		t.Fatalf("expected desktop listing, got: %s", result)
+	}
+	if !strings.Contains(result, "desktop-note.txt") {
+		t.Fatalf("expected desktop file in output, got: %s", result)
+	}
+	if !strings.Contains(result, "Visible entries in "+downloads) {
+		t.Fatalf("expected downloads listing, got: %s", result)
+	}
+	if !strings.Contains(result, "downloads-note.txt") {
+		t.Fatalf("expected downloads file in output, got: %s", result)
+	}
+}
+
+func TestRunComposedReadThenSummarize(t *testing.T) {
+	root := t.TempDir()
+	filePath := filepath.Join(root, "notes.txt")
+	if err := os.WriteFile(filePath, []byte("First line\nSecond line"), 0o644); err != nil {
+		t.Fatalf("seed note file: %v", err)
+	}
+
+	orch, err := NewOrchestrator([]string{root}, stubPlanner{err: fmt.Errorf("planner should not run")})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	result := orch.RunWithMode("hey can you read "+filePath+" and then summarize it", "chat")
+	if !strings.Contains(result, "Summary:") {
+		t.Fatalf("expected summarize output, got: %s", result)
+	}
+	if !strings.Contains(result, "notes.txt") {
+		t.Fatalf("expected summarized filename in output, got: %s", result)
 	}
 }
 
