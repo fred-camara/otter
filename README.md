@@ -97,6 +97,14 @@ otter chat
 ```bash
 otter "organize my downloads"
 otter "organize my music files in ~/Downloads/audio"
+otter organize audio --root ~/Downloads/audio --context-root ~/Downloads --dry-run
+otter organize audio --root ~/Downloads/audio --context-root ~/Downloads --execute
+otter organize audio --root ~/Downloads/audio --context-root ~/Downloads --execute --deper-analysis
+otter organize audio --plan ~/Downloads/audio/audio_plan_20260426-120000.jsonl --inspect
+otter plan inspect ~/Downloads/audio/audio_plan_20260426-120000.jsonl
+otter cleanup empty-folders --root ~/Downloads --dry-run
+otter cleanup empty-folders --root ~/Downloads --stage --confirm
+otter cleanup empty-folders --root ~/Downloads --stage --stage-root ~/Downloads/empty-review --confirm
 ```
 
 Batch moves start as dry-runs. If the plan looks right, re-run with explicit confirmation:
@@ -104,6 +112,21 @@ Batch moves start as dry-runs. If the plan looks right, re-run with explicit con
 ```bash
 otter "organize my downloads confirm=true"
 ```
+
+Audio organize profile (`otter organize audio`) is local-first and scope-limited:
+- only audio files under the chosen `--root` are planned/moved
+- dry-run by default
+- explicit approval (`y` / `yes`) is required before execution
+- actions are audited and plan/report files are written in the audio root
+- plan inspection is available before execution (`otter plan inspect <plan.jsonl>`)
+- execution writes an empty-folder report (reporting only, no deletion): `empty_folders_<timestamp>.md`
+- `--deper-analysis` (also accepts `--deeper-analysis`) increases model ambiguity-analysis budget
+
+Standalone empty-folder workflow is also available:
+- `otter cleanup empty-folders --root ~/Downloads --dry-run`
+- aliases: `otter clean empty-folders ...`, `otter report empty-folders ...`
+- optional staging (no deletion): `otter cleanup empty-folders --root ~/Downloads --stage --confirm`
+- optional custom staging folder: `--stage-root <path>`
 
 ### Summarize Files
 
@@ -183,6 +206,11 @@ Commands inside chat:
 ```
 
 Anything else is treated like a normal Otter task.
+
+Audio organize requests in chat use the same shared organizer engine as the CLI command. Example prompts:
+- `Organize my audio folder`
+- `Separate mp3 songs from wav samples`
+- `Execute the audio organization`
 
 ## Audit Logs
 

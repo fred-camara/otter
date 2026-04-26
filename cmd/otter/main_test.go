@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -327,6 +328,159 @@ func TestHandleShowRunLatestWorks(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(text), "planner_parse") {
 		t.Fatalf("expected key error in output, got %q", text)
+	}
+}
+
+func TestHandleOrganizeCommandDryRun(t *testing.T) {
+	home := t.TempDir()
+	audioRoot := filepath.Join(home, "Downloads", "audio")
+	if err := os.MkdirAll(audioRoot, 0o755); err != nil {
+		t.Fatalf("mkdir audio root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(audioRoot, "song.mp3"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed song: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+
+	var out bytes.Buffer
+	err := handleOrganizeCommand([]string{"audio", "--root", audioRoot, "--context-root", filepath.Join(home, "Downloads"), "--dry-run"}, strings.NewReader(""), &out)
+	if err != nil {
+		t.Fatalf("handleOrganizeCommand dry-run: %v", err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "Audio organization plan") {
+		t.Fatalf("expected plan summary, got %q", text)
+	}
+	if !strings.Contains(text, "Dry-run only") {
+		t.Fatalf("expected dry-run output, got %q", text)
+	}
+}
+
+func TestHandleOrganizeCommandExecuteNeedsYes(t *testing.T) {
+	home := t.TempDir()
+	audioRoot := filepath.Join(home, "Downloads", "audio")
+	if err := os.MkdirAll(audioRoot, 0o755); err != nil {
+		t.Fatalf("mkdir audio root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(audioRoot, "song.mp3"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed song: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+
+	var out bytes.Buffer
+	err := handleOrganizeCommand([]string{"audio", "--root", audioRoot, "--context-root", filepath.Join(home, "Downloads"), "--execute"}, strings.NewReader("n\n"), &out)
+	if err != nil {
+		t.Fatalf("handleOrganizeCommand execute: %v", err)
+	}
+	if !strings.Contains(out.String(), "Proceed with this plan? [y/N]") {
+		t.Fatalf("expected approval prompt, got %q", out.String())
+	}
+	if !strings.Contains(out.String(), "Execution cancelled") {
+		t.Fatalf("expected cancellation output, got %q", out.String())
+	}
+}
+
+func TestHandleOrganizeCommandAcceptsDeperAnalysisFlag(t *testing.T) {
+	home := t.TempDir()
+	audioRoot := filepath.Join(home, "Downloads", "audio")
+	if err := os.MkdirAll(audioRoot, 0o755); err != nil {
+		t.Fatalf("mkdir audio root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(audioRoot, "song.mp3"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed song: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+
+	var out bytes.Buffer
+	err := handleOrganizeCommand([]string{"audio", "--root", audioRoot, "--context-root", filepath.Join(home, "Downloads"), "--dry-run", "--deper-analysis"}, strings.NewReader(""), &out)
+	if err != nil {
+		t.Fatalf("handleOrganizeCommand with --deper-analysis: %v", err)
+	}
+	if !strings.Contains(out.String(), "Audio organization plan") {
+		t.Fatalf("expected plan output, got %q", out.String())
+	}
+}
+
+func TestHandlePlanInspectCommand(t *testing.T) {
+	home := t.TempDir()
+	audioRoot := filepath.Join(home, "Downloads", "audio")
+	if err := os.MkdirAll(audioRoot, 0o755); err != nil {
+		t.Fatalf("mkdir audio root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(audioRoot, "song.mp3"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed song: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+
+	var planOut bytes.Buffer
+	if err := handleOrganizeCommand([]string{"audio", "--root", audioRoot, "--context-root", filepath.Join(home, "Downloads"), "--dry-run"}, strings.NewReader(""), &planOut); err != nil {
+		t.Fatalf("dry-run plan generation: %v", err)
+	}
+	reportsDir := filepath.Join(audioRoot, ".otter-reports")
+	entries, err := os.ReadDir(reportsDir)
+	if err != nil {
+		t.Fatalf("read reports dir: %v", err)
+	}
+	planPath := ""
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "audio_plan_") && strings.HasSuffix(entry.Name(), ".jsonl") {
+			planPath = filepath.Join(reportsDir, entry.Name())
+			break
+		}
+	}
+	if planPath == "" {
+		t.Fatalf("expected audio plan file")
+	}
+
+	var out bytes.Buffer
+	if err := handlePlanCommand([]string{"inspect", planPath}, &out); err != nil {
+		t.Fatalf("handlePlanCommand: %v", err)
+	}
+	if !strings.Contains(out.String(), "Plan inspection:") {
+		t.Fatalf("expected inspection output, got %q", out.String())
+	}
+}
+
+func TestHandleCleanupCommandStandalone(t *testing.T) {
+	home := t.TempDir()
+	downloads := filepath.Join(home, "Downloads")
+	empty := filepath.Join(downloads, "old", "tmp")
+	if err := os.MkdirAll(empty, 0o755); err != nil {
+		t.Fatalf("mkdir empty: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+
+	var out bytes.Buffer
+	err := handleCleanupCommand([]string{"cleanup", "empty-folders", "--root", downloads, "--dry-run"}, &out)
+	if err != nil {
+		t.Fatalf("handleCleanupCommand: %v", err)
+	}
+	if !strings.Contains(out.String(), "Detected") || !strings.Contains(out.String(), "empty folders") {
+		t.Fatalf("expected cleanup summary output, got %q", out.String())
+	}
+}
+
+func TestHandleCleanupCommandStageRequiresConfirm(t *testing.T) {
+	home := t.TempDir()
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(filepath.Join(downloads, "old"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+
+	var out bytes.Buffer
+	err := handleCleanupCommand([]string{"cleanup", "empty-folders", "--root", downloads, "--stage"}, &out)
+	if err != nil {
+		t.Fatalf("expected preview without error, got %v", err)
+	}
+	if !strings.Contains(out.String(), "Proceed? [y/N]") {
+		t.Fatalf("expected staging preview prompt, got %q", out.String())
 	}
 }
 

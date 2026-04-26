@@ -857,3 +857,185 @@ func TestUndoLastMoveRestoresFiles(t *testing.T) {
 		t.Fatalf("expected file restored to original location: %v", err)
 	}
 }
+
+func TestRunAudioOrganizeChatDryRunThenApprove(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "otter", "config.json")
+	audioRoot := filepath.Join(home, "Downloads", "audio")
+	if err := os.MkdirAll(audioRoot, 0o755); err != nil {
+		t.Fatalf("mkdir audio root: %v", err)
+	}
+	source := filepath.Join(audioRoot, "track.mp3")
+	if err := os.WriteFile(source, []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed track: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	orch, err := NewOrchestrator([]string{filepath.Join(home, "Downloads")}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	planReply := orch.RunWithMode("Organize my audio folder", "chat")
+	if !strings.Contains(planReply, "Proceed with this plan? [y/N]") {
+		t.Fatalf("expected approval prompt, got: %s", planReply)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("dry-run should not move file: %v", err)
+	}
+
+	execReply := orch.RunWithMode("yes", "chat")
+	if !strings.Contains(strings.ToLower(execReply), "audio organization executed") {
+		t.Fatalf("expected execution confirmation, got: %s", execReply)
+	}
+	candidates := []string{
+		filepath.Join(audioRoot, "music", "unknown_music", "track.mp3"),
+		filepath.Join(audioRoot, "review", "ambiguous", "track.mp3"),
+		filepath.Join(audioRoot, "review", "low_confidence", "track.mp3"),
+	}
+	found := false
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected moved file after approval in expected destinations")
+	}
+}
+
+func TestRunAudioOrganizeExecuteWithoutYesOnlyPlans(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "otter", "config.json")
+	audioRoot := filepath.Join(home, "Downloads", "audio")
+	if err := os.MkdirAll(audioRoot, 0o755); err != nil {
+		t.Fatalf("mkdir audio root: %v", err)
+	}
+	source := filepath.Join(audioRoot, "track.mp3")
+	if err := os.WriteFile(source, []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed track: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	orch, err := NewOrchestrator([]string{filepath.Join(home, "Downloads")}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+
+	reply := orch.RunWithMode("Execute the audio organization", "chat")
+	if !strings.Contains(reply, "Proceed with this plan? [y/N]") {
+		t.Fatalf("expected explicit confirmation request, got: %s", reply)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("file should remain in place without explicit yes: %v", err)
+	}
+}
+
+func TestRunCleanupEmptyFoldersFromChat(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "otter", "config.json")
+	downloads := filepath.Join(home, "Downloads")
+	empty := filepath.Join(downloads, "legacy", "unused")
+	if err := os.MkdirAll(empty, 0o755); err != nil {
+		t.Fatalf("mkdir empty: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", configPath)
+
+	orch, err := NewOrchestrator([]string{downloads}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	reply := orch.RunWithMode("Find empty folders in Downloads", "chat")
+	if !strings.Contains(reply, "Detected") || !strings.Contains(reply, "empty folders") {
+		t.Fatalf("expected cleanup reply, got: %s", reply)
+	}
+	if _, err := os.Stat(empty); err != nil {
+		t.Fatalf("folder should not be deleted: %v", err)
+	}
+}
+
+func TestRunCleanupListEmptyFoldersFromChat(t *testing.T) {
+	home := t.TempDir()
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(filepath.Join(downloads, "empty"), 0o755); err != nil {
+		t.Fatalf("mkdir empty: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+	orch, err := NewOrchestrator([]string{downloads}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	reply := orch.RunWithMode("list empty folders in downloads", "chat")
+	if !strings.Contains(reply, "Detected") || !strings.Contains(reply, "empty folders") {
+		t.Fatalf("expected empty-folders list response, got: %s", reply)
+	}
+}
+
+func TestRunCleanupStageThemYesUsesPendingRoot(t *testing.T) {
+	home := t.TempDir()
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(filepath.Join(downloads, "empty"), 0o755); err != nil {
+		t.Fatalf("mkdir empty: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+
+	orch, err := NewOrchestrator([]string{downloads}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	first := orch.RunWithMode("find empty folders in downloads", "chat")
+	if !strings.Contains(first, "Detected") {
+		t.Fatalf("expected report reply, got: %s", first)
+	}
+	second := orch.RunWithMode("stage them yes", "chat")
+	if !strings.Contains(second, "Moved") || !strings.Contains(second, "staging") {
+		t.Fatalf("expected staged response, got: %s", second)
+	}
+}
+
+func TestRunCleanupStageInDownloadsYesResolvesNamedPath(t *testing.T) {
+	home := t.TempDir()
+	downloads := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(filepath.Join(downloads, "empty"), 0o755); err != nil {
+		t.Fatalf("mkdir empty: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("OTTER_CONFIG_FILE", filepath.Join(home, ".config", "otter", "config.json"))
+	orch, err := NewOrchestrator([]string{downloads}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	reply := orch.RunWithMode("stage empty folders in Downloads yes", "chat")
+	if !strings.Contains(reply, "Moved") {
+		t.Fatalf("expected staged response, got: %s", reply)
+	}
+}
+
+func TestCleanupAccessDeniedMessageIncludesAttemptedAndAllowedRoots(t *testing.T) {
+	home := t.TempDir()
+	allowed := filepath.Join(home, "Downloads", "audio")
+	disallowed := filepath.Join(home, "Downloads")
+	if err := os.MkdirAll(filepath.Join(disallowed, "empty"), 0o755); err != nil {
+		t.Fatalf("mkdir disallowed root: %v", err)
+	}
+	orch, err := NewOrchestrator([]string{allowed}, stubPlanner{})
+	if err != nil {
+		t.Fatalf("new orchestrator: %v", err)
+	}
+	reply := orch.RunWithMode("stage empty folders in "+disallowed+" yes", "chat")
+	if !strings.Contains(reply, disallowed) {
+		t.Fatalf("expected attempted path in denial, got: %s", reply)
+	}
+	if !strings.Contains(reply, allowed) {
+		t.Fatalf("expected allowed root in denial, got: %s", reply)
+	}
+	if !strings.Contains(strings.ToLower(reply), "allow access") {
+		t.Fatalf("expected actionable grant phrase in denial, got: %s", reply)
+	}
+}

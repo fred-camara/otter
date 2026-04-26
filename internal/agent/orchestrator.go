@@ -1,10 +1,12 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -15,7 +17,9 @@ import (
 	"time"
 
 	"otter/internal/audit"
+	"otter/internal/cleanup"
 	"otter/internal/model"
+	"otter/internal/organize"
 	"otter/internal/permissions"
 	"otter/internal/planner"
 	"otter/internal/recovery"
@@ -30,12 +34,22 @@ const (
 )
 
 type Orchestrator struct {
-	registry    *tools.Registry
-	planner     planner.Planner
-	modelGen    model.Interface
-	allowedDirs []string
-	modelName   string
-	audit       *audit.Logger
+	registry       *tools.Registry
+	planner        planner.Planner
+	modelGen       model.Interface
+	allowedDirs    []string
+	modelName      string
+	audit          *audit.Logger
+	pendingCleanup *pendingCleanupContext
+}
+
+type pendingCleanupContext struct {
+	Root                  string
+	ReportPath            string
+	DetectedEmptyCount    int
+	ProtectedSkippedCount int
+	Timestamp             time.Time
+	SuggestedStageCommand string
 }
 
 func NewOrchestrator(allowedDirs []string, planner planner.Planner) (*Orchestrator, error) {
@@ -146,6 +160,12 @@ func (o *Orchestrator) RunWithMode(task, mode string) (output string) {
 	if response, handled := o.handleRecoveryTask(task); handled {
 		return response
 	}
+	if response, handled := o.handleCleanupEmptyFoldersTask(task); handled {
+		return response
+	}
+	if response, handled := o.handleAudioOrganizeTask(task, mode); handled {
+		return response
+	}
 
 	if directCall, ok := o.directToolCallForTask(task); ok {
 		return o.executeToolCall(task, directCall)
@@ -203,6 +223,480 @@ func (o *Orchestrator) RunWithMode(task, mode string) (output string) {
 	}
 
 	return o.executeToolCall(task, parsed)
+}
+
+func (o *Orchestrator) RunOrganizeAudioCLI(root, contextRoot string, execute, deeperAnalysis bool, in io.Reader, out io.Writer) (string, error) {
+	runTask := fmt.Sprintf("organize audio --root %s --context-root %s --execute=%t --deeper-analysis=%t", root, contextRoot, execute, deeperAnalysis)
+	o.audit = audit.Start(runTask, "cli", firstNonEmpty(o.modelName, defaultModelName))
+	defer func() {
+		if o.audit != nil {
+			o.audit = nil
+		}
+	}()
+	org := organize.NewService(o.audit, o.modelGen)
+	plan, err := org.GeneratePlan(organize.GeneratePlanRequest{
+		Profile:        organize.ProfileAudio,
+		Root:           root,
+		ContextRoot:    contextRoot,
+		RequestID:      o.audit.RunID(),
+		DeeperAnalysis: deeperAnalysis,
+	})
+	if err != nil {
+		o.audit.LogError("organize_audio_generate_plan", err)
+		return "", err
+	}
+	summary := org.SummarizePlan(plan)
+	if !execute {
+		o.audit.LogFinalOutput("🦦 " + summary + "\n\nDry-run only. No files were moved.")
+		return "🦦 " + summary + "\n\nDry-run only. No files were moved.", nil
+	}
+
+	reader := bufio.NewReader(in)
+	fmt.Fprintln(out, summary)
+	fmt.Fprint(out, "\nProceed with this plan? [y/N] ")
+	answer, _ := reader.ReadString('\n')
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	if answer != "y" && answer != "yes" {
+		message := "🦦 Execution cancelled. No files were moved."
+		o.audit.LogFinalOutput(message)
+		return message, nil
+	}
+
+	result, err := org.ExecutePlan(organize.ExecutePlanRequest{
+		Plan:     plan,
+		Approved: true,
+	})
+	if err != nil {
+		o.audit.LogError("organize_audio_execute", err)
+		return "", err
+	}
+	lines := []string{
+		"🦦 Audio organization executed safely.",
+		fmt.Sprintf("Moved: %d", result.Executed),
+		fmt.Sprintf("Skipped: %d", result.Skipped),
+		fmt.Sprintf("Detected %d empty folders. Wrote report: %s", result.EmptyFolderCount, result.EmptyFolderReportPath),
+		fmt.Sprintf("Plan log: %s", plan.PlanPath),
+		fmt.Sprintf("Execution report: %s", result.ExecutionLogPath),
+	}
+	message := strings.Join(lines, "\n")
+	o.audit.LogFinalOutput(message)
+	return message, nil
+}
+
+func (o *Orchestrator) RunCleanupEmptyFoldersCLI(root string) (string, error) {
+	runTask := fmt.Sprintf("cleanup empty-folders --root %s", root)
+	o.audit = audit.Start(runTask, "cli", firstNonEmpty(o.modelName, defaultModelName))
+	defer func() {
+		if o.audit != nil {
+			o.audit = nil
+		}
+	}()
+	resolvedRoot, err := tools.ResolvePath(root)
+	if err != nil {
+		return "", err
+	}
+	if !pathWithinAllowed(resolvedRoot, o.allowedDirs) {
+		return "", fmt.Errorf("cleanup root is outside allowed directories")
+	}
+	service := cleanup.NewService(o.audit)
+	result, err := service.GenerateEmptyFoldersReport(cleanup.ReportRequest{
+		Scopes: []cleanup.Scope{
+			{Label: "Inside root", Root: resolvedRoot},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	message := "🦦 " + cleanup.SummarizeReport(result) + fmt.Sprintf("\nDetected %d empty folders. Wrote report: %s", result.Total, result.ReportPath)
+	o.pendingCleanup = &pendingCleanupContext{
+		Root:                  resolvedRoot,
+		ReportPath:            result.ReportPath,
+		DetectedEmptyCount:    result.Total,
+		ProtectedSkippedCount: result.ProtectedSkippedTotal,
+		Timestamp:             time.Now().UTC(),
+		SuggestedStageCommand: fmt.Sprintf("stage empty folders in %s yes", resolvedRoot),
+	}
+	o.audit.LogFinalOutput(message)
+	return message, nil
+}
+
+func (o *Orchestrator) RunStageEmptyFoldersCLI(root, stageRoot string, confirm bool) (string, error) {
+	runTask := fmt.Sprintf("cleanup empty-folders stage --root %s --stage-root %s", root, stageRoot)
+	o.audit = audit.Start(runTask, "cli", firstNonEmpty(o.modelName, defaultModelName))
+	defer func() {
+		if o.audit != nil {
+			o.audit = nil
+		}
+	}()
+	resolvedRoot, err := tools.ResolvePath(root)
+	if err != nil {
+		return "", err
+	}
+	if !pathWithinAllowed(resolvedRoot, o.allowedDirs) {
+		return "", fmt.Errorf(o.cleanupAccessDeniedMessage(resolvedRoot))
+	}
+	service := cleanup.NewService(o.audit)
+	if !confirm {
+		preview, previewErr := service.PreviewStageEmptyFolders(resolvedRoot)
+		if previewErr != nil {
+			return "", previewErr
+		}
+		return preview.Preview + "\n\nProceed? [y/N]\nRe-run with --confirm to stage.", nil
+	}
+	result, err := service.StageEmptyFolders(cleanup.StageRequest{
+		Root:      resolvedRoot,
+		StageRoot: stageRoot,
+	})
+	if err != nil {
+		return "", err
+	}
+	message := fmt.Sprintf("🦦 Moved %d empty folders into staging: %s\nDetected %d empty folders. Wrote report: %s", result.Moved, result.StageRoot, result.TotalFound, result.ReportPath)
+	o.pendingCleanup = &pendingCleanupContext{
+		Root:                  resolvedRoot,
+		ReportPath:            result.ReportPath,
+		DetectedEmptyCount:    result.TotalFound,
+		ProtectedSkippedCount: result.ProtectedSkippedTotal,
+		Timestamp:             time.Now().UTC(),
+		SuggestedStageCommand: fmt.Sprintf("stage empty folders in %s yes", resolvedRoot),
+	}
+	o.audit.LogFinalOutput(message)
+	return message, nil
+}
+
+func (o *Orchestrator) handleAudioOrganizeTask(task, mode string) (string, bool) {
+	trimmed := strings.TrimSpace(task)
+	lower := strings.ToLower(trimmed)
+	if lower == "" {
+		return "", false
+	}
+
+	org := organize.NewService(o.audit, o.modelGen)
+	if mode == "chat" && (lower == "y" || lower == "yes") {
+		pending, err := org.LoadPendingPlan()
+		if err != nil {
+			return "🦦 I don't have a pending audio plan to execute.", true
+		}
+		result, execErr := org.ExecutePlan(organize.ExecutePlanRequest{
+			Plan:     pending.Plan,
+			Approved: true,
+		})
+		if execErr != nil {
+			return fmt.Sprintf("🦦 I couldn't execute the pending audio plan: %v", execErr), true
+		}
+		_ = org.ClearPendingPlan()
+		return fmt.Sprintf("🦦 Audio organization executed.\nMoved: %d\nSkipped: %d\nDetected %d empty folders. Wrote report: %s\nExecution report: %s", result.Executed, result.Skipped, result.EmptyFolderCount, result.EmptyFolderReportPath, result.ExecutionLogPath), true
+	}
+
+	if !isAudioOrganizeRequest(lower) {
+		return "", false
+	}
+
+	root, contextRoot, deeperAnalysis, err := extractAudioScopeFromTask(trimmed)
+	if err != nil {
+		return fmt.Sprintf("🦦 I couldn't parse audio organize scope: %v", err), true
+	}
+	resolvedRoot, err := tools.ResolvePath(root)
+	if err != nil {
+		return fmt.Sprintf("🦦 I couldn't resolve organize root: %v", err), true
+	}
+	if !pathWithinAllowed(resolvedRoot, o.allowedDirs) {
+		return fmt.Sprintf("🦦 organize root is outside allowed directories\n\n%s", o.accessGuidance()), true
+	}
+
+	plan, err := org.GeneratePlan(organize.GeneratePlanRequest{
+		Profile:        organize.ProfileAudio,
+		Root:           root,
+		ContextRoot:    contextRoot,
+		RequestID:      o.audit.RunID(),
+		DeeperAnalysis: deeperAnalysis,
+	})
+	if err != nil {
+		return fmt.Sprintf("🦦 I couldn't generate audio organization plan: %v", err), true
+	}
+	summary := org.SummarizePlan(plan)
+
+	executeRequested := strings.Contains(lower, "execute")
+	explicitApprove := hasExplicitYes(lower)
+	if !executeRequested {
+		_ = org.SavePendingPlan(plan)
+		return "🦦 " + summary + "\n\nProceed with this plan? [y/N]\nReply `yes` to execute.", true
+	}
+	if !explicitApprove {
+		_ = org.SavePendingPlan(plan)
+		return "🦦 " + summary + "\n\nProceed with this plan? [y/N]\nReply `yes` to execute.", true
+	}
+
+	result, err := org.ExecutePlan(organize.ExecutePlanRequest{
+		Plan:     plan,
+		Approved: true,
+	})
+	if err != nil {
+		return fmt.Sprintf("🦦 I couldn't execute the audio organization plan: %v", err), true
+	}
+	_ = org.ClearPendingPlan()
+	return fmt.Sprintf("🦦 Audio organization executed.\nMoved: %d\nSkipped: %d\nDetected %d empty folders. Wrote report: %s\nExecution report: %s", result.Executed, result.Skipped, result.EmptyFolderCount, result.EmptyFolderReportPath, result.ExecutionLogPath), true
+}
+
+func (o *Orchestrator) handleCleanupEmptyFoldersTask(task string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(task))
+	if !isCleanupEmptyFoldersRequest(lower) {
+		return "", false
+	}
+	root, err := extractCleanupRootFromTask(task, o.pendingCleanup)
+	if err != nil {
+		return fmt.Sprintf("🦦 I couldn't parse cleanup scope: %v", err), true
+	}
+	resolvedRoot, err := tools.ResolvePath(root)
+	if err != nil {
+		return fmt.Sprintf("🦦 I couldn't resolve cleanup root: %v", err), true
+	}
+	if !pathWithinAllowed(resolvedRoot, o.allowedDirs) {
+		return "🦦 " + o.cleanupAccessDeniedMessage(resolvedRoot), true
+	}
+	service := cleanup.NewService(o.audit)
+	if wantsStageEmptyFolders(lower) {
+		if !hasExplicitYes(lower) {
+			preview, previewErr := service.PreviewStageEmptyFolders(resolvedRoot)
+			if previewErr != nil {
+				return fmt.Sprintf("🦦 I couldn't prepare empty-folder staging preview: %v", previewErr), true
+			}
+			return "🦦 " + preview.Preview + "\n\nProceed? [y/N]\nReply with the same request plus `yes` to confirm staging.", true
+		}
+		stageResult, stageErr := service.StageEmptyFolders(cleanup.StageRequest{
+			Root: resolvedRoot,
+		})
+		if stageErr != nil {
+			return fmt.Sprintf("🦦 I couldn't stage empty folders: %v", stageErr), true
+		}
+		o.pendingCleanup = &pendingCleanupContext{
+			Root:                  resolvedRoot,
+			ReportPath:            stageResult.ReportPath,
+			DetectedEmptyCount:    stageResult.TotalFound,
+			ProtectedSkippedCount: stageResult.ProtectedSkippedTotal,
+			Timestamp:             time.Now().UTC(),
+			SuggestedStageCommand: fmt.Sprintf("stage empty folders in %s yes", resolvedRoot),
+		}
+		return fmt.Sprintf("🦦 Moved %d empty folders into staging: %s\nDetected %d empty folders. Wrote report: %s", stageResult.Moved, stageResult.StageRoot, stageResult.TotalFound, stageResult.ReportPath), true
+	}
+
+	result, err := service.GenerateEmptyFoldersReport(cleanup.ReportRequest{
+		Scopes: []cleanup.Scope{{Label: "Inside root", Root: resolvedRoot}},
+	})
+	if err != nil {
+		return fmt.Sprintf("🦦 I couldn't generate empty-folder report: %v", err), true
+	}
+	o.pendingCleanup = &pendingCleanupContext{
+		Root:                  resolvedRoot,
+		ReportPath:            result.ReportPath,
+		DetectedEmptyCount:    result.Total,
+		ProtectedSkippedCount: result.ProtectedSkippedTotal,
+		Timestamp:             time.Now().UTC(),
+		SuggestedStageCommand: fmt.Sprintf("stage empty folders in %s yes", resolvedRoot),
+	}
+	return "🦦 " + cleanup.SummarizeReport(result) + fmt.Sprintf("\nDetected %d empty folders. Wrote report:\n%s\nI can stage them into a review folder with:\n`%s`", result.Total, result.ReportPath, o.pendingCleanup.SuggestedStageCommand), true
+}
+
+func isAudioOrganizeRequest(taskLower string) bool {
+	if strings.Contains(taskLower, "organize audio") {
+		return true
+	}
+	if strings.Contains(taskLower, "organize my audio") {
+		return true
+	}
+	if strings.Contains(taskLower, "audio folder") {
+		return true
+	}
+	if strings.Contains(taskLower, "audio organization") {
+		return true
+	}
+	if strings.Contains(taskLower, "separate mp3") || strings.Contains(taskLower, "separate wav") {
+		return true
+	}
+	return false
+}
+
+func isCleanupEmptyFoldersRequest(taskLower string) bool {
+	if strings.Contains(taskLower, "cleanup empty-folders") ||
+		strings.Contains(taskLower, "clean empty-folders") ||
+		strings.Contains(taskLower, "report empty-folders") {
+		return true
+	}
+	if refersToPreviousCleanup(taskLower) {
+		return true
+	}
+	if strings.Contains(taskLower, "empty folder") || strings.Contains(taskLower, "empty folders") {
+		return strings.Contains(taskLower, "find") ||
+			strings.Contains(taskLower, "list") ||
+			strings.Contains(taskLower, "report") ||
+			strings.Contains(taskLower, "show") ||
+			strings.Contains(taskLower, "cleanup") ||
+			strings.Contains(taskLower, "stage") ||
+			strings.Contains(taskLower, "move")
+	}
+	return false
+}
+
+func wantsStageEmptyFolders(taskLower string) bool {
+	if refersToPreviousCleanup(taskLower) {
+		return strings.Contains(taskLower, "stage") || strings.Contains(taskLower, "move")
+	}
+	return (strings.Contains(taskLower, "empty folder") || strings.Contains(taskLower, "empty folders")) &&
+		(strings.Contains(taskLower, "stage") || strings.Contains(taskLower, "move"))
+}
+
+func hasExplicitYes(taskLower string) bool {
+	parts := strings.Fields(taskLower)
+	for _, part := range parts {
+		token := strings.Trim(part, ".,!?;:")
+		if token == "y" || token == "yes" {
+			return true
+		}
+	}
+	return false
+}
+
+func extractAudioScopeFromTask(task string) (string, string, bool, error) {
+	root := "~/Downloads/audio"
+	contextRoot := "~/Downloads"
+	deeper := false
+	lowerTask := strings.ToLower(task)
+	if strings.Contains(lowerTask, "deeper analysis") || strings.Contains(lowerTask, "deper analysis") {
+		deeper = true
+	}
+	parts := strings.Fields(task)
+	for i := 0; i < len(parts); i++ {
+		token := strings.TrimSpace(parts[i])
+		if token == "--root" && i+1 < len(parts) {
+			root = sanitizeTaskPath(parts[i+1])
+			i++
+			continue
+		}
+		if token == "--context-root" && i+1 < len(parts) {
+			contextRoot = sanitizeTaskPath(parts[i+1])
+			i++
+			continue
+		}
+		if token == "--deper-analysis" || token == "--deeper-analysis" {
+			deeper = true
+			continue
+		}
+		lower := strings.ToLower(token)
+		if lower == "deeper-analysis" || lower == "deep-analysis" {
+			deeper = true
+		}
+	}
+	return root, contextRoot, deeper, nil
+}
+
+func extractCleanupRootFromTask(task string, pending *pendingCleanupContext) (string, error) {
+	root := ""
+	parts := strings.Fields(task)
+	for i := 0; i < len(parts); i++ {
+		token := strings.TrimSpace(parts[i])
+		if token == "--root" && i+1 < len(parts) {
+			root = sanitizeTaskPath(parts[i+1])
+			i++
+			continue
+		}
+	}
+	lower := strings.ToLower(task)
+	for _, marker := range []string{" in ", " under ", " inside "} {
+		if idx := strings.LastIndex(lower, marker); idx >= 0 {
+			candidate := sanitizeCleanupPathSegment(task[idx+len(marker):])
+			if strings.TrimSpace(candidate) != "" {
+				root = normalizeNamedFolderRoot(candidate)
+			}
+			break
+		}
+	}
+	if strings.TrimSpace(root) == "" {
+		if pending != nil && refersToPreviousCleanup(lower) {
+			return pending.Root, nil
+		}
+		if strings.Contains(lower, "downloads") {
+			return "~/Downloads", nil
+		}
+		if strings.Contains(lower, "audio folder") || strings.Contains(lower, "audio") {
+			home, _ := os.UserHomeDir()
+			audioPath := filepath.Join(home, "Downloads", "audio")
+			if info, err := os.Stat(audioPath); err == nil && info.IsDir() {
+				return audioPath, nil
+			}
+			return "~/Downloads/audio", nil
+		}
+		if pending != nil {
+			return pending.Root, nil
+		}
+		return "~/Downloads", nil
+	}
+	return normalizeNamedFolderRoot(root), nil
+}
+
+func refersToPreviousCleanup(lowerTask string) bool {
+	trimmed := strings.TrimSpace(lowerTask)
+	if trimmed == "stage them" || trimmed == "stage them yes" || trimmed == "yes stage them" {
+		return true
+	}
+	if strings.Contains(lowerTask, "stage them") ||
+		strings.Contains(lowerTask, "stage those") ||
+		strings.Contains(lowerTask, "stage empty folders yes") ||
+		strings.Contains(lowerTask, "move them to review") ||
+		strings.Contains(lowerTask, "the same folder") {
+		return true
+	}
+	if strings.Contains(lowerTask, "there") && strings.Contains(lowerTask, "stage") {
+		return true
+	}
+	return false
+}
+
+func sanitizeCleanupPathSegment(value string) string {
+	candidate := sanitizeTaskPath(value)
+	for _, stop := range []string{" yes", " confirm", " please", " now", " and ", " but "} {
+		lower := strings.ToLower(candidate)
+		if idx := strings.Index(lower, stop); idx >= 0 {
+			candidate = strings.TrimSpace(candidate[:idx])
+		}
+	}
+	return strings.TrimSpace(candidate)
+}
+
+func normalizeNamedFolderRoot(value string) string {
+	clean := strings.TrimSpace(value)
+	lower := strings.ToLower(clean)
+	switch lower {
+	case "downloads", "my downloads":
+		return "~/Downloads"
+	case "documents", "my documents":
+		return "~/Documents"
+	case "desktop", "my desktop":
+		return "~/Desktop"
+	case "audio", "my audio folder":
+		return "~/Downloads/audio"
+	default:
+		return clean
+	}
+}
+
+func (o *Orchestrator) cleanupAccessDeniedMessage(attempted string) string {
+	lines := []string{
+		"I tried to stage or report empty folders under:",
+		attempted,
+		"",
+		"But Otter currently has access only to:",
+	}
+	if len(o.allowedDirs) == 0 {
+		lines = append(lines, "- (no allowed directories configured)")
+	} else {
+		for _, dir := range o.allowedDirs {
+			lines = append(lines, "- "+dir)
+		}
+	}
+	lines = append(lines, "",
+		"You can grant access with:",
+		`otter "allow access to ~/Downloads"`,
+	)
+	return strings.Join(lines, "\n")
 }
 
 func (o *Orchestrator) conversationalFallbackForPlannerFailure(task string) (string, bool) {

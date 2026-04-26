@@ -18,6 +18,7 @@ import (
 	"otter/internal/agent"
 	"otter/internal/audit"
 	"otter/internal/config"
+	"otter/internal/organize"
 	"otter/internal/settings"
 	"otter/internal/transport"
 )
@@ -90,6 +91,27 @@ func main() {
 		}
 		return
 	}
+	if args[0] == "organize" {
+		if err := handleOrganizeCommand(args[1:], os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "organize error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if args[0] == "cleanup" || args[0] == "clean" || args[0] == "report" {
+		if err := handleCleanupCommand(args, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "cleanup error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if args[0] == "plan" {
+		if err := handlePlanCommand(args[1:], os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "plan error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	task := strings.TrimSpace(strings.Join(args, " "))
 	if task == "" {
@@ -115,6 +137,9 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  %s model show\n", bin)
 	fmt.Fprintf(os.Stderr, "  %s runs\n", bin)
 	fmt.Fprintf(os.Stderr, "  %s show run <id|latest>\n", bin)
+	fmt.Fprintf(os.Stderr, "  %s organize audio [--root PATH] [--context-root PATH] [--dry-run|--execute] [--deper-analysis]\n", bin)
+	fmt.Fprintf(os.Stderr, "  %s plan inspect <path> [--filter text]\n", bin)
+	fmt.Fprintf(os.Stderr, "  %s cleanup empty-folders [--root PATH] [--dry-run] [--stage --confirm] [--stage-root PATH]\n", bin)
 }
 
 type chatTurn struct {
@@ -481,6 +506,183 @@ func setModel(modelName string, out io.Writer) error {
 
 	fmt.Fprintf(out, "Saved model in config: %s\n", modelName)
 	fmt.Fprintf(out, "If needed, install it locally with: ollama pull %s\n", modelName)
+	return nil
+}
+
+func handleOrganizeCommand(args []string, in io.Reader, out io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: otter organize audio [--root PATH] [--context-root PATH] [--dry-run|--execute] [--deper-analysis]")
+	}
+	if strings.ToLower(strings.TrimSpace(args[0])) != "audio" {
+		return fmt.Errorf("unsupported organize profile: %s", args[0])
+	}
+
+	root := "~/Downloads/audio"
+	contextRoot := "~/Downloads"
+	dryRun := false
+	execute := false
+	deeperAnalysis := false
+	inspect := false
+	planPath := ""
+	filter := ""
+
+	for i := 1; i < len(args); i++ {
+		token := strings.TrimSpace(args[i])
+		switch token {
+		case "--root":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--root requires a value")
+			}
+			root = args[i+1]
+			i++
+		case "--context-root":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--context-root requires a value")
+			}
+			contextRoot = args[i+1]
+			i++
+		case "--dry-run":
+			dryRun = true
+		case "--execute":
+			execute = true
+		case "--deper-analysis", "--deeper-analysis":
+			deeperAnalysis = true
+		case "--inspect":
+			inspect = true
+		case "--plan":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--plan requires a value")
+			}
+			planPath = args[i+1]
+			i++
+		case "--filter":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--filter requires a value")
+			}
+			filter = args[i+1]
+			i++
+		default:
+			return fmt.Errorf("unknown organize audio arg: %s", token)
+		}
+	}
+	if inspect {
+		if strings.TrimSpace(planPath) == "" {
+			return fmt.Errorf("--inspect requires --plan <path>")
+		}
+		service := organize.NewService(nil)
+		result, err := service.InspectPlan(planPath, filter)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(out, result)
+		return nil
+	}
+
+	if !dryRun && !execute {
+		dryRun = true
+	}
+	if dryRun && execute {
+		return fmt.Errorf("choose either --dry-run or --execute")
+	}
+
+	orch, err := agent.NewOrchestratorForMode("cli")
+	if err != nil {
+		return err
+	}
+	result, err := orch.RunOrganizeAudioCLI(root, contextRoot, execute, deeperAnalysis, in, out)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(out, result)
+	return nil
+}
+
+func handlePlanCommand(args []string, out io.Writer) error {
+	if len(args) < 2 || strings.ToLower(strings.TrimSpace(args[0])) != "inspect" {
+		return fmt.Errorf("usage: otter plan inspect <path> [--filter text]")
+	}
+	planPath := strings.TrimSpace(args[1])
+	if planPath == "" {
+		return fmt.Errorf("plan path is required")
+	}
+	filter := ""
+	for i := 2; i < len(args); i++ {
+		token := strings.TrimSpace(args[i])
+		switch token {
+		case "--filter":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--filter requires a value")
+			}
+			filter = args[i+1]
+			i++
+		default:
+			return fmt.Errorf("unknown plan inspect arg: %s", token)
+		}
+	}
+	service := organize.NewService(nil)
+	result, err := service.InspectPlan(planPath, filter)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(out, result)
+	return nil
+}
+
+func handleCleanupCommand(args []string, out io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: otter cleanup empty-folders [--root PATH] [--dry-run] [--stage --confirm] [--stage-root PATH]")
+	}
+	command := strings.ToLower(strings.TrimSpace(args[0]))
+	rest := args[1:]
+	if command == "clean" || command == "report" {
+		rest = args[1:]
+	}
+	if len(rest) == 0 || strings.ToLower(strings.TrimSpace(rest[0])) != "empty-folders" {
+		return fmt.Errorf("usage: otter cleanup empty-folders [--root PATH] [--dry-run] [--stage --confirm] [--stage-root PATH]")
+	}
+	root := "~/Downloads"
+	stage := false
+	confirm := false
+	stageRoot := ""
+	for i := 1; i < len(rest); i++ {
+		token := strings.TrimSpace(rest[i])
+		switch token {
+		case "--root":
+			if i+1 >= len(rest) {
+				return fmt.Errorf("--root requires a value")
+			}
+			root = rest[i+1]
+			i++
+		case "--dry-run":
+			// reporting-only behavior; accepted for UX consistency.
+		case "--stage":
+			stage = true
+		case "--confirm":
+			confirm = true
+		case "--stage-root":
+			if i+1 >= len(rest) {
+				return fmt.Errorf("--stage-root requires a value")
+			}
+			stageRoot = rest[i+1]
+			i++
+		default:
+			return fmt.Errorf("unknown cleanup arg: %s", token)
+		}
+	}
+	orch, err := agent.NewOrchestratorForMode("cli")
+	if err != nil {
+		return err
+	}
+	var result string
+	if stage {
+		result, err = orch.RunStageEmptyFoldersCLI(root, stageRoot, confirm)
+	} else {
+		result, err = orch.RunCleanupEmptyFoldersCLI(root)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(out, result)
 	return nil
 }
 
